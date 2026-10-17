@@ -1,0 +1,672 @@
+const express = require('express');
+const cors = require('cors');
+const path = require('path');
+const sqlite3 = require('sqlite3').verbose();
+const pl = require('tau-prolog');
+const { encodeCommand, resolveIntentWithProlog } = require('./ml_tokenizer');
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+const DEFAULT_USER = "red_player_1";
+const USER_ID_RE = /^[A-Za-z0-9_-]{1,40}$/;
+const MAX_COMMAND_LENGTH = 200;
+
+// ============================================================================
+// DATABASE LAYER
+// ============================================================================
+const db = new sqlite3.Database(path.join(__dirname, 'game_data.db'));
+
+const runSQL = (sql, params = []) =>
+    new Promise((resolve, reject) => db.run(sql, params, (err) => (err ? reject(err) : resolve())));
+
+const dbReady = new Promise((resolve, reject) => {
+    db.serialize(() => {
+        db.run(`
+            CREATE TABLE IF NOT EXISTS player_sessions_v3 (
+                user_id TEXT PRIMARY KEY,
+                location TEXT,
+                stayed_on_path INTEGER,
+                talked_to_wolf INTEGER,
+                revealed_destination INTEGER,
+                forest_delay INTEGER,
+                hummed_tune INTEGER,
+                warned_woodcutter INTEGER,
+                commotion_level INTEGER,
+                clues_noticed INTEGER,
+                clues_seen TEXT,
+                wolf_subdued INTEGER,
+                grandmother_untied INTEGER,
+                grandmother_wellness INTEGER,
+                inventory TEXT,
+                chaos_outcome TEXT
+            )
+        `);
+        db.run(`
+            CREATE TABLE IF NOT EXISTS chaos_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT,
+                command TEXT,
+                resulting_outcome TEXT,
+                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            )
+        `, (err) => (err ? reject(err) : resolve()));
+    });
+});
+
+const getPlayerStateFromDB = (userId) =>
+    new Promise((resolve, reject) => {
+        db.get(`SELECT * FROM player_sessions_v3 WHERE user_id = ?`, [userId], (err, row) => {
+            if (err) return reject(err);
+            if (!row) return resolve(null);
+            resolve(Object.freeze({
+                location: row.location,
+                stayedOnPath: Boolean(row.stayed_on_path),
+                talkedToWolf: Boolean(row.talked_to_wolf),
+                revealedDestination: Boolean(row.revealed_destination),
+                forestDelay: row.forest_delay,
+                hummedTune: Boolean(row.hummed_tune),
+                warnedWoodcutter: Boolean(row.warned_woodcutter),
+                commotionLevel: row.commotion_level,
+                cluesNoticed: row.clues_noticed,
+                cluesSeen: Object.freeze(JSON.parse(row.clues_seen)),
+                wolfSubdued: Boolean(row.wolf_subdued),
+                grandmotherUntied: Boolean(row.grandmother_untied),
+                grandmotherWellness: row.grandmother_wellness,
+                inventory: Object.freeze(JSON.parse(row.inventory))
+            }));
+        });
+    });
+
+const savePlayerStateToDB = (userId, s, outcome) =>
+    runSQL(`
+        INSERT OR REPLACE INTO player_sessions_v3 (
+            user_id, location, stayed_on_path, talked_to_wolf, revealed_destination,
+            forest_delay, hummed_tune, warned_woodcutter, commotion_level, clues_noticed,
+            clues_seen, wolf_subdued, grandmother_untied, grandmother_wellness,
+            inventory, chaos_outcome
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `, [
+        userId, s.location,
+        s.stayedOnPath ? 1 : 0, s.talkedToWolf ? 1 : 0, s.revealedDestination ? 1 : 0,
+        s.forestDelay, s.hummedTune ? 1 : 0, s.warnedWoodcutter ? 1 : 0,
+        s.commotionLevel, s.cluesNoticed, JSON.stringify(s.cluesSeen),
+        s.wolfSubdued ? 1 : 0, s.grandmotherUntied ? 1 : 0, s.grandmotherWellness,
+        JSON.stringify(s.inventory), outcome
+    ]);
+
+// Serialize requests per player so read-modify-write cycles never interleave
+// (double-submits previously lost updates).
+const userLocks = new Map();
+const withUserLock = (userId, fn) => {
+    const prev = userLocks.get(userId) || Promise.resolve();
+    const run = prev.then(fn);
+    const tail = run.catch(() => {});
+    userLocks.set(userId, tail);
+    tail.then(() => { if (userLocks.get(userId) === tail) userLocks.delete(userId); });
+    return run;
+};
+
+// ============================================================================
+// 1. OBJECT-ORIENTED PARADIGM
+// ============================================================================
+class GameEntity {
+    constructor(name, description) {
+        this.name = name;
+        this.description = description;
+    }
+    examine() {
+        return this.description;
+    }
+}
+
+class HealingItem extends GameEntity {
+    constructor(name, description, wellnessPoints) {
+        super(name, description);
+        this.wellnessPoints = wellnessPoints;
+    }
+}
+
+class ForestDetail extends GameEntity {
+    constructor(name, description, causesDelay = false) {
+        super(name, description);
+        this.causesDelay = causesDelay;
+    }
+}
+
+class NPC extends GameEntity {
+    constructor(name, description, dialogue) {
+        super(name, description);
+        this.dialogue = dialogue;
+    }
+    speak() {
+        return this.dialogue;
+    }
+}
+
+class Location extends GameEntity {
+    constructor(id, name, description, smells, sounds, peacefulDescription = null) {
+        super(name, description);
+        this.id = id;
+        this.smells = smells;
+        this.sounds = sounds;
+        this.peacefulDescription = peacefulDescription;
+    }
+}
+
+const basketItems = [
+    new HealingItem("bread", "Freshly baked bread prepared by your caring mother.", 15),
+    new HealingItem("wine", "A bottle of sweet wine intended to lift Grandmother's spirits.", 10),
+    new HealingItem("cakes", "An assortment of comforting sweet cakes.", 10),
+    new HealingItem("remedies", "Herbal remedies for Grandmother, who is resting in bed with a cold.", 30)
+];
+
+const forestEntities = {
+    cloak: new GameEntity("cloak", "Your vibrant, hooded red cloak—a cherished gift from your adoring grandmother."),
+    squirrels: new ForestDetail("squirrels", "Squirrels scurrying rapidly up the dark, towering oak trees.", true),
+    rabbits: new ForestDetail("rabbits", "Rabbits dashing playfully through the shadowy underbrush.", true),
+    deer: new ForestDetail("deer", "Deer grazing peacefully in the sun-dappled forest clearings.", true),
+    birds: new ForestDetail("birds", "Woodland birds chirping melodiously in the canopy above.", false),
+    trees: new ForestDetail("trees", "Tall, ancient trees casting long shadows across the meandering path.", false),
+    spectacles: new GameEntity("spectacles", "Grandmother's spectacles, resting awkwardly on a suspiciously large snout."),
+    closet: new GameEntity("closet", "A sturdy wooden closet in the corner of the cottage.")
+};
+
+const npcs = {
+    wolf: new NPC(
+        "wolf",
+        "A cunning wolf with gleaming eyes hiding sinister intentions behind a friendly facade.",
+        '"Where are you going, Little Red Riding Hood? And where does your grandmother live?" he asks sweetly.'
+    ),
+    woodcutter: new NPC(
+        "woodcutter",
+        "A brave woodcutter working nearby in the forest, wielding a trusty axe honed from years of labor.",
+        '"Be careful on the path, little one. My sharp ears are always listening if you need help."'
+    )
+};
+
+const worldMap = {
+    forest_path: new Location(
+        "forest_path",
+        "The Deep, Mysterious Forest Path",
+        "Tall trees cast long shadows across the well-trodden path. Squirrels scurry up trees, rabbits dash through the underbrush, and deer graze in clearings. A cunning wolf lurks near the path, while a woodcutter works in the distance.",
+        "The crisp scent of pine and fresh earth fills the air.",
+        "You hear rustling leaves, melodiously chirping birds, and the distant chop of a woodcutter's axe."
+    ),
+    cottage_exterior: new Location(
+        "cottage_exterior",
+        "Grandmother's Quaint Cottage (Outside)",
+        "You stand before Grandmother's cottage on the other side of the forest. The house is unusually silent, shrouded in an eerie, deceptive calm. A wooden latch sits on the front door.",
+        "A faint trace of woodsmoke and baked bread drifts from the chimney.",
+        "An eerie silence hangs over the cottage, broken only by the wind in the trees."
+    ),
+    cottage_interior: new Location(
+        "cottage_interior",
+        "Grandmother's Cozy Cottage (Inside)",
+        "The aroma of freshly baked bread lingers in the air. A large, disheveled figure lies in Grandmother's bed wearing her nightgown, cap, and spectacles. A wooden closet stands in the corner.",
+        "The warm aroma of freshly baked bread contrasts sharply with the scent of a wild predator.",
+        "Every creak of the floorboards echoes through the quiet room, along with heavy, raspy breathing from the bed.",
+        "The aroma of freshly baked bread lingers in the air. Grandmother sits up in her bed in her nightgown and cap, smiling warmly. A wooden closet stands in the corner."
+    )
+};
+
+// ============================================================================
+// 2. FUNCTIONAL PARADIGM
+// ============================================================================
+// Wellness is a real score now. A perfect 100 needs the clean route:
+//   start 35 + 65 (full basket) = 100.
+// Penalties at delivery: -5 per turn dawdling (max -30), -10 for speaking to the
+// wolf, -15 if Grandmother had to be rescued from the closet (she gets +10 for
+// being freed first). Wolf routes therefore land around 85, dawdling lowers it more.
+const WELLNESS_START = 35;
+const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
+
+const createInitialState = () => Object.freeze({
+    location: "forest_path",
+    stayedOnPath: true,
+    talkedToWolf: false,
+    revealedDestination: false,
+    forestDelay: 0,
+    hummedTune: false,
+    warnedWoodcutter: false,
+    commotionLevel: 0,
+    cluesNoticed: 0,
+    cluesSeen: Object.freeze([]),
+    wolfSubdued: false,
+    grandmotherUntied: false,
+    grandmotherWellness: WELLNESS_START,
+    inventory: Object.freeze(basketItems.map(item => item.name))
+});
+
+const applyTransition = (currentState, updaterFn) => Object.freeze(updaterFn({ ...currentState }));
+
+const lingerInWoods = (state) => ({ ...state, stayedOnPath: false, forestDelay: state.forestDelay + 1 });
+const humMelody = (state) => ({ ...state, hummedTune: true, commotionLevel: state.commotionLevel + 1 });
+const alertWoodcutter = (state) => ({ ...state, warnedWoodcutter: true });
+const speakToStranger = (state) => ({ ...state, talkedToWolf: true, revealedDestination: true });
+const moveTo = (location) => (state) => ({ ...state, location });
+
+// Each clue (eyes / ears / teeth) counts once; the count is derived from the set.
+const noticeClue = (clue) => (state) => {
+    if (state.cluesSeen.includes(clue)) return state;
+    const cluesSeen = Object.freeze([...state.cluesSeen, clue]);
+    return { ...state, cluesSeen, cluesNoticed: cluesSeen.length };
+};
+
+const subdueWolfAndRescue = (state) => ({ ...state, wolfSubdued: true });
+
+const untieGrandmotherFromCloset = (state) => ({
+    ...state,
+    grandmotherUntied: true,
+    grandmotherWellness: clamp(state.grandmotherWellness + 10, 0, 100)
+});
+
+const deliveryPenalty = (state) =>
+    Math.min(30, state.forestDelay * 5) +
+    (state.talkedToWolf ? 10 : 0) +
+    (state.wolfSubdued ? 15 : 0);
+
+const deliverRemedies = (state, items) => {
+    const boost = items
+        .filter(item => state.inventory.includes(item.name))
+        .reduce((sum, item) => sum + item.wellnessPoints, 0);
+    return {
+        ...state,
+        grandmotherWellness: clamp(state.grandmotherWellness + boost - deliveryPenalty(state), 0, 100),
+        inventory: Object.freeze([])
+    };
+};
+
+const isWoodcutterAlerted = (s) => s.warnedWoodcutter || (s.hummedTune && s.commotionLevel >= 2);
+
+// ============================================================================
+// 3. LOGIC PARADIGM: Prolog Chaos Engine
+// ============================================================================
+const CHAOS_RULES = `
+    % Wolf beats Red to the cottage if she tells him OR dawdles off-path twice
+    wolf_infiltrated :- talked_to_wolf(true), revealed_destination(true).
+    wolf_infiltrated :- stayed_on_path(false), forest_delay(D), D >= 2.
+
+    % Woodcutter is in earshot if warned, or Red hummed repeatedly
+    woodcutter_alerted :- warned_woodcutter(true).
+    woodcutter_alerted :- hummed_tune(true), commotion_level(C), C >= 2.
+
+    preemptive_rescue :- wolf_infiltrated, warned_woodcutter(true), clues_noticed(N), N >= 1.
+    classic_rescue    :- wolf_infiltrated, clues_noticed(N), N >= 3, woodcutter_alerted.
+    unrescued_ambush  :- wolf_infiltrated, clues_noticed(N), N >= 3, \\+ woodcutter_alerted.
+    safe_reunion      :- \\+ wolf_infiltrated.
+
+    story_outcome(grandmother_saved_and_untied) :- grandmother_untied(true), !.
+    story_outcome(preemptive_woodcutter_rescue) :- preemptive_rescue, !.
+    story_outcome(classic_woodcutter_rescue)    :- classic_rescue, !.
+    story_outcome(wolf_overwhelms_red)          :- unrescued_ambush, !.
+    story_outcome(wolf_waiting_in_disguise)     :- wolf_infiltrated, !.
+    story_outcome(peaceful_visit)               :- safe_reunion, !.
+    story_outcome(uncertain).
+`;
+
+const evaluateChaosRules = (state) =>
+    new Promise((resolve, reject) => {
+        const session = pl.create();
+        const facts = `
+            stayed_on_path(${state.stayedOnPath}).
+            talked_to_wolf(${state.talkedToWolf}).
+            revealed_destination(${state.revealedDestination}).
+            forest_delay(${state.forestDelay}).
+            hummed_tune(${state.hummedTune}).
+            warned_woodcutter(${state.warnedWoodcutter}).
+            commotion_level(${state.commotionLevel}).
+            clues_noticed(${state.cluesNoticed}).
+            grandmother_untied(${state.grandmotherUntied}).
+        `;
+        session.consult(facts + CHAOS_RULES, {
+            success: () => {
+                session.query("story_outcome(Outcome).", {
+                    success: () => {
+                        session.answer(answer => {
+                            if (pl.type.is_error(answer)) reject(new Error(pl.format_answer(answer)));
+                            else if (pl.type.is_substitution(answer)) resolve(answer.lookup("Outcome").id);
+                            else resolve("uncertain");
+                        });
+                    },
+                    error: reject
+                });
+            },
+            error: reject
+        });
+    });
+
+// ============================================================================
+// 4. IMPERATIVE PARADIGM: Command table & Route Handlers
+// ============================================================================
+// Prolog resolves every command to a CANONICAL verb/target (the keys of LEXICON),
+// so the table below is keyed by those and holds no alias lists of its own.
+const CLUE_TEXT = {
+    eyes: '"Grandmother, what big eyes you have!"\n"The better to see you with, my dear," replies a forced, uncharacteristically rough voice.',
+    ears: '"Oh, Grandmother, what big ears you have!"\n"The better to hear you with, my dear," comes the unsettling response.',
+    teeth: '"And, Grandmother, what big teeth you have!"\n"The better to eat you with!" the voice growls.'
+};
+const CLUES = new Set(Object.keys(CLUE_TEXT));
+const LOOK_AROUND = new Set(["around", "path", "cottage"]);
+
+const describeLocation = (state, priorOutcome) => {
+    const loc = worldMap[state.location];
+    const friendly = priorOutcome === "peaceful_visit" || state.grandmotherUntied;
+    return friendly && loc.peacefulDescription ? loc.peacefulDescription : loc.examine();
+};
+
+const goToCottage = (state) => {
+    const s = applyTransition(state, moveTo("cottage_exterior"));
+    return { state: s, text: worldMap.cottage_exterior.examine() };
+};
+
+const handlers = {
+    listen: ({ state }) => ({ text: worldMap[state.location].sounds }),
+
+    smell: ({ state }) => ({ text: worldMap[state.location].smells }),
+
+    hum: ({ state }) => {
+        const s = applyTransition(state, humMelody);
+        return {
+            state: s,
+            text: s.commotionLevel >= 2
+                ? "You hum louder. The tune carries through the trees—the woodcutter has surely heard you by now."
+                : "You hum a cheerful tune softly to yourself. It might carry to the woodcutter's ears... if you keep it up."
+        };
+    },
+
+    watch: ({ state, target }) => {
+        if (state.location !== "forest_path") return { text: "There are no forest creatures here." };
+        const entity = forestEntities[target];
+        if (entity instanceof ForestDetail && entity.causesDelay) {
+            const s = applyTransition(state, lingerInWoods);
+            return {
+                state: s,
+                text: `${entity.examine()}\nYou linger off the path, losing precious time (Forest Delay: ${s.forestDelay}).`
+            };
+        }
+        if (entity instanceof ForestDetail) {
+            return { text: `${entity.examine()}\nYou watch them quietly without straying from the path.` };
+        }
+        return { text: `You watch the ${target && target !== "around" ? target : "surroundings"} quietly.` };
+    },
+
+    examine: ({ state, target, priorOutcome }) => {
+        const inCottage = state.location === "cottage_interior";
+        const peaceful = priorOutcome === "peaceful_visit";
+
+        if (!target || LOOK_AROUND.has(target)) {
+            return { text: describeLocation(state, priorOutcome) };
+        }
+        if (target === "basket") {
+            const items = basketItems.filter(i => state.inventory.includes(i.name));
+            return {
+                text: items.length === 0
+                    ? "Your basket is empty; Grandmother has received all her treats and herbal remedies."
+                    : "Your basket contains:\n" + items.map(i => `• ${i.name.toUpperCase()}: ${i.examine()}`).join("\n")
+            };
+        }
+        if (inCottage && CLUES.has(target)) {
+            if (peaceful) return { text: `Grandmother smiles warmly. Her ${target} look perfectly ordinary—nothing amiss at all.` };
+            if (state.wolfSubdued) return { text: "The wolf has been subdued. There's nothing more to learn from the bed." };
+            const s = applyTransition(state, noticeClue(target));
+            let text = CLUE_TEXT[target];
+            if (s.cluesNoticed >= 3) {
+                text += "\nThe disguise falls away—the wolf leaps from the bed!";
+            } else if (s.cluesNoticed === 2 && !isWoodcutterAlerted(s)) {
+                text += "\nA chill runs down your spine: if this goes wrong, no one is close enough to hear you. Perhaps make some noise first ('hum tune').";
+            }
+            return { state: s, text };
+        }
+        if (inCottage && (target === "figure" || target === "grandmother")) {
+            if (peaceful) return { text: "Grandmother beams at you from her bed, a little pale from her cold but perfectly herself." };
+            if (state.grandmotherUntied) return { text: "Grandmother is free, safe, and holding your hand." };
+            if (state.wolfSubdued) return { text: "The subdued wolf lies where the 'Grandmother' once was. The real one is in the closet!" };
+            return { text: "The figure in the bed looks much larger and more disheveled than you remember. Try examining her 'eyes', 'ears', or 'teeth'." };
+        }
+        if (forestEntities[target]) return { text: forestEntities[target].examine() };
+        if (npcs[target]) return { text: npcs[target].examine() };
+        return { text: `You look closely at the ${target}, keeping your mother's wise words in mind.` };
+    },
+
+    talk: ({ state, target }) => {
+        if (state.location === "cottage_interior") return { text: "There is no one to speak with here except the figure in the bed." };
+        if (state.location !== "forest_path") return { text: "There is no one here to talk to." };
+        if (target === "wolf") {
+            return {
+                state: applyTransition(state, speakToStranger),
+                text: `${npcs.wolf.speak()}\nOblivious to the danger, you reply, "I'm off to visit my grandmother and bring her some treats at her cottage on the other side of the forest."`
+            };
+        }
+        if (target === "woodcutter") {
+            return {
+                state: applyTransition(state, alertWoodcutter),
+                text: `${npcs.woodcutter.speak()}\nThe woodcutter nods and promises to keep watch near Grandmother's cottage!`
+            };
+        }
+        return { text: "Specify who you want to talk to: 'talk to wolf' or 'talk to woodcutter'." };
+    },
+
+    wander: ({ state }) => {
+        if (state.location !== "forest_path") {
+            return { text: "There is nowhere to wander off to from here." };
+        }
+        const s = applyTransition(state, lingerInWoods);
+        return {
+            state: s,
+            text: `Ignoring your mother's stern advice to stay on the path, you wander into the shadowy clearings (Forest Delay: ${s.forestDelay}).`
+        };
+    },
+
+    walk: ({ state, target }) => {
+        if (target === "back") return handlers.back({ state });
+        if (state.location === "forest_path") return goToCottage(state);
+        if (state.location === "cottage_exterior") return { text: "The door is latched. Try 'knock on door' or 'lift latch' to enter." };
+        return { text: "You are already inside Grandmother's cottage." };
+    },
+
+    back: ({ state }) => {
+        if (state.location === "cottage_exterior") {
+            return {
+                state: applyTransition(state, moveTo("forest_path")),
+                text: "You retrace your steps to the forest path.\n" + worldMap.forest_path.examine()
+            };
+        }
+        if (state.location === "forest_path") return { text: "You are already on the forest path." };
+        return { text: "The door has swung shut behind you. There's no leaving until this is resolved." };
+    },
+
+    open: async ({ state, target, priorOutcome }) => {
+        const loc = state.location;
+
+        if (loc === "forest_path") {
+            if (target === "cottage" || target === "latch") return goToCottage(state);
+            return { text: "There is nothing here to open. The cottage lies ahead: try 'walk to cottage'." };
+        }
+
+        if (loc === "cottage_exterior") {
+            if (!["latch", "cottage", "around"].includes(target)) {
+                return { text: "Specify what you want to open or lift (e.g., 'lift latch' or 'knock on door')." };
+            }
+            const s = applyTransition(state, moveTo("cottage_interior"));
+            const outcome = await evaluateChaosRules(s);
+            return {
+                state: s,
+                text: outcome === "peaceful_visit"
+                    ? 'Grandmother warmly invites you inside! Since you stayed on the path and ignored strangers, the wolf never beat you here. Use "give basket" to deliver her treats and herbal remedies!'
+                    : 'A hoarse voice calls out, "Lift the latch and come in, dear." You push the door open and step inside.\n' + worldMap.cottage_interior.examine()
+            };
+        }
+
+        // cottage_interior
+        if (target === "closet" || target === "grandmother") {
+            if (state.grandmotherUntied) return { text: "Grandmother is already free." };
+            if (priorOutcome === "peaceful_visit") return { text: "The closet holds nothing but Grandmother's spare linens." };
+            if (state.wolfSubdued) {
+                return {
+                    state: applyTransition(state, untieGrandmotherFromCloset),
+                    text: "You and the woodcutter open the closet and carefully untie Grandmother! She embraces you tightly in profound relief. Now type 'give basket' to deliver her remedies and treats."
+                };
+            }
+            return { text: "You cannot reach the closet while the figure in the bed watches your every move!" };
+        }
+        return { text: "Specify what you want to open (e.g., 'open closet')." };
+    },
+
+    give: ({ state, target, priorOutcome }) => {
+        if (state.location !== "cottage_interior") return { text: "You must be inside Grandmother's cottage to deliver the basket." };
+        if (target === "wolf") return { text: "You would never hand your mother's treats to a stranger with teeth like that." };
+        if (state.inventory.length === 0) return { text: "Your basket is already empty—Grandmother has everything you brought." };
+        if (priorOutcome === "peaceful_visit" || state.grandmotherUntied) {
+            const s = applyTransition(state, st => deliverRemedies(st, basketItems));
+            const perfect = s.grandmotherWellness === 100;
+            return {
+                state: s,
+                text: `You hand over the freshly baked bread, sweet wine, sweet cakes, and herbal remedies. Grandmother's spirits and health soar! Final UN SDG Goal 3 Wellness Score: ${s.grandmotherWellness}%!` +
+                    (perfect ? "" : "\nA perfect 100% needs the clean route: stay on the path, never speak to the stranger, and arrive before the wolf does.")
+            };
+        }
+        if (state.wolfSubdued) return { text: "Grandmother is still tied up in the closet! Free her first." };
+        return { text: "Something feels dangerously wrong with the figure in the bed! Examine her 'eyes', 'ears', or 'teeth' first." };
+    },
+
+    help: () => ({
+        text: [
+            "Available Commands:",
+            "• Sensory & Exploration: 'look around', 'listen', 'smell', 'hum tune', 'examine basket', 'examine cloak'",
+            "• Forest Interactions: 'watch squirrels/rabbits/deer', 'talk to woodcutter', 'talk to wolf', 'wander off path'",
+            "• Movement: 'walk to cottage', 'go back'",
+            "• Cottage Progression: 'lift latch', 'examine spectacles', 'examine eyes/ears/teeth'",
+            "• Resolution: 'open closet', 'untie grandmother', 'give basket'"
+        ].join("\n")
+    })
+};
+
+const runCommand = async (userId, command) => {
+    let state = (await getPlayerStateFromDB(userId)) || createInitialState();
+
+    // --- ML layer: BPE tokenize (+typo snapping) -> Prolog intent ---
+    const enc = encodeCommand(command);
+    const { verb, target } = await resolveIntentWithProlog(enc.words);
+    const resolved = verb !== "unknown";
+    const corrected = enc.corrections.map(c => `${c.from}→${c.to}`).join(", ");
+    const mlTelemetry = {
+        subwords: enc.subwords,
+        tokenIds: enc.tokenIds,
+        corrections: enc.corrections,
+        resolvedIntent: resolved
+            ? `${verb.toUpperCase()} -> ${target.toUpperCase()}${corrected ? ` (fixed: ${corrected})` : ""}`
+            : "UNRESOLVED"
+    };
+
+    const priorOutcome = await evaluateChaosRules(state);
+    if (priorOutcome === "wolf_overwhelms_red") {
+        return {
+            response: "The wolf has already gotten you. Press 'Reset Timeline' to try again.",
+            chaosOutcome: priorOutcome,
+            state,
+            mlTelemetry
+        };
+    }
+
+    // "back" is a target in the lexicon, so "go back" / "return" work with any verb.
+    const key = target === "back" ? "back" : verb;
+    const handler = handlers[key];
+    let narrativeResponse = "Unrecognized command. Type 'help' to see all supported commands.";
+
+    if (resolved && handler) {
+        const result = await handler({ state, target, priorOutcome });
+        narrativeResponse = result.text;
+        if (result.state) state = result.state;
+    }
+
+    // Re-evaluate Prolog after the command's state transition
+    const chaosOutcome = await evaluateChaosRules(state);
+
+    if (state.location === "cottage_interior" && !state.wolfSubdued) {
+        if (chaosOutcome === "preemptive_woodcutter_rescue") {
+            state = applyTransition(state, subdueWolfAndRescue);
+            narrativeResponse += "\n\n[PROLOG OUTCOME: PREEMPTIVE RESCUE]\nBecause you warned the woodcutter in the forest, he was already standing guard outside! The moment you question the disguised wolf, he bursts in with his trusty axe and subdues the predator! Type 'open closet' to free Grandmother.";
+        } else if (chaosOutcome === "classic_woodcutter_rescue") {
+            state = applyTransition(state, subdueWolfAndRescue);
+            narrativeResponse += "\n\n[PROLOG OUTCOME: HEROIC RESCUE]\nThe woodcutter's sharp ears hear the commotion from nearby! He rushes in, brandishes his trusty axe, and subdues the wolf! Type 'open closet' to untie Grandmother.";
+        } else if (chaosOutcome === "wolf_overwhelms_red") {
+            narrativeResponse += "\n\n[PROLOG OUTCOME: AMBUSH]\nNo one is near enough to hear you. The wolf overwhelms you. GAME OVER—press 'Reset Timeline' to try again.";
+        }
+    }
+
+    await savePlayerStateToDB(userId, state, chaosOutcome);
+    runSQL(`INSERT INTO chaos_logs (user_id, command, resulting_outcome) VALUES (?, ?, ?)`,
+        [userId, command, chaosOutcome]).catch(err => console.error("chaos_logs insert failed:", err.message));
+
+    return { response: narrativeResponse, chaosOutcome, state, mlTelemetry };
+};
+
+const WELCOME_TEXT = "Welcome to LITTLE RED RIDING HOOD: CHAOS IN THE DEEP WOODS.\nYour mother hands you a basket of bread, sweet wine, sweet cakes, and herbal remedies for your ailing Grandmother.\n\"Stay on the path and avoid talking to strangers!\" she warns.\nType 'help' for commands, or 'look around' to begin.";
+
+const resolveUserId = (raw) => {
+    const userId = raw === undefined ? DEFAULT_USER : raw;
+    return typeof userId === "string" && USER_ID_RE.test(userId) ? userId : null;
+};
+const badUser = (res) => res.status(400).json({ error: "Invalid account ID (use 1-40 letters, digits, '_' or '-')." });
+
+app.post('/api/command', async (req, res) => {
+    const userId = resolveUserId(req.body?.userId);
+    if (!userId) return badUser(res);
+    const command = req.body?.command;
+    if (typeof command !== "string" || command.length > MAX_COMMAND_LENGTH) {
+        return res.status(400).json({ error: `Command must be text of at most ${MAX_COMMAND_LENGTH} characters.` });
+    }
+    try {
+        await dbReady;
+        res.json(await withUserLock(userId, () => runCommand(userId, command)));
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+// Load (without creating) a player's saved timeline so the UI can resume it.
+app.get('/api/state', async (req, res) => {
+    const userId = resolveUserId(req.query.userId);
+    if (!userId) return badUser(res);
+    try {
+        await dbReady;
+        const saved = await withUserLock(userId, () => getPlayerStateFromDB(userId));
+        const state = saved || createInitialState();
+        res.json({
+            response: saved
+                ? `Resumed saved timeline for '${userId}'. Type 'look around' to get your bearings, or press Reset Timeline to start over.`
+                : WELCOME_TEXT,
+            chaosOutcome: await evaluateChaosRules(state),
+            state,
+            isNew: !saved
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/api/reset', async (req, res) => {
+    const userId = resolveUserId(req.body?.userId);
+    if (!userId) return badUser(res);
+    try {
+        await dbReady;
+        const initialState = createInitialState();
+        const outcome = await evaluateChaosRules(initialState);
+        await withUserLock(userId, () => savePlayerStateToDB(userId, initialState, outcome));
+        res.json({
+            response: "Timeline reset. Mother hands you the basket of bread, sweet wine, sweet cakes, and herbal remedies: 'Stay on the path and avoid talking to strangers!' Type 'help' for commands.",
+            chaosOutcome: outcome,
+            state: initialState
+        });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`Multi-Paradigm Zork Server running on http://localhost:${PORT}`));
