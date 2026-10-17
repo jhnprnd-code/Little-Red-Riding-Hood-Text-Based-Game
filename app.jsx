@@ -108,9 +108,12 @@ export default function App() {
   const gs = gameState;
   const chapterSummary = (() => {
     if (!gs) return null;
-    const { chaosOutcome, factionAffinity, grandmotherUntied, grandmotherWellness, wolfSubdued } = gs;
+    const { chaosOutcome, factionAffinity, grandmotherUntied, grandmotherWellness, wolfSubdued, warnedWoodcutter } = gs;
     if (chaosOutcome === 'peaceful_visit') {
       return 'CHAPTER SUMMARY — The forest holds. You preserve the path, keep the bargain of the woods, and leave the cottage in a state of uneasy calm.';
+    }
+    if (chaosOutcome === 'standoff') {
+      return `CHAPTER SUMMARY — The cottage turns into a stand-off. ${factionAffinity === 'forest' ? 'You stand with the wolf and the forest.' : 'You stand between the wolf and the axe.'} The woodcutter is already at the door, and the land itself seems to wait for your choice.`;
     }
     if (chaosOutcome === 'preemptive_woodcutter_rescue' || chaosOutcome === 'classic_woodcutter_rescue' || grandmotherUntied) {
       return `CHAPTER SUMMARY — The cottage is no longer a lie. ${factionAffinity === 'forest' ? 'You stood with the forest.' : factionAffinity === 'woodcutter' ? 'You stood with the ragged edge of survival.' : 'You chose the hard path between both.'} Wellness: ${grandmotherWellness}%.`;
@@ -118,7 +121,7 @@ export default function App() {
     if (chaosOutcome === 'wolf_overwhelms_red') {
       return 'CHAPTER SUMMARY — The loop closes. The forest remembers your failure, and the path opens again for another attempt.';
     }
-    if (wolfSubdued) {
+    if (wolfSubdued || (factionAffinity === 'forest' && warnedWoodcutter)) {
       return 'CHAPTER SUMMARY — The wolf is subdued, but the land remains haunted by the old bargain between fear, hunger, and memory.';
     }
     return 'CHAPTER SUMMARY — The day remains unresolved. The forest is watching, and it has not finished speaking yet.';

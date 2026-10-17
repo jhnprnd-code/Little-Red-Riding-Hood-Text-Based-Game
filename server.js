@@ -351,9 +351,16 @@ const CHAOS_RULES = `
     wolf_infiltrated :- talked_to_wolf(true), revealed_destination(true).
     wolf_infiltrated :- stayed_on_path(false), forest_delay(D), D >= 2.
 
+    % The wolf is trying to escape the woodcutter's threat, not simply hunt Red.
+    wolf_seeking_refuge :- faction_affinity(forest), talked_to_wolf(true).
+    wolf_seeking_refuge :- faction_affinity(forest), stayed_on_path(false), forest_delay(D), D >= 2.
+
     % Woodcutter is in earshot if warned, or Red hummed repeatedly
     woodcutter_alerted :- warned_woodcutter(true).
     woodcutter_alerted :- hummed_tune(true), commotion_level(C), C >= 2.
+
+    % A forest-aligned playthrough can end in a tense stand-off when the wolf and woodcutter meet at the cottage.
+    standoff_at_cottage :- wolf_seeking_refuge, woodcutter_alerted.
 
     preemptive_rescue :- wolf_infiltrated, warned_woodcutter(true), clues_noticed(N), N >= 1.
     classic_rescue    :- wolf_infiltrated, clues_noticed(N), N >= 3, woodcutter_alerted.
@@ -361,6 +368,7 @@ const CHAOS_RULES = `
     safe_reunion      :- \\+ wolf_infiltrated.
 
     story_outcome(grandmother_saved_and_untied) :- grandmother_untied(true), !.
+    story_outcome(standoff)                     :- standoff_at_cottage, !.
     story_outcome(preemptive_woodcutter_rescue) :- preemptive_rescue, !.
     story_outcome(classic_woodcutter_rescue)    :- classic_rescue, !.
     story_outcome(wolf_overwhelms_red)          :- unrescued_ambush, !.
@@ -382,6 +390,7 @@ const evaluateChaosRules = (state) =>
             commotion_level(${state.commotionLevel}).
             clues_noticed(${state.cluesNoticed}).
             grandmother_untied(${state.grandmotherUntied}).
+            faction_affinity(${state.factionAffinity || 'neutral'}).
         `;
         session.consult(facts + CHAOS_RULES, {
             success: () => {
@@ -426,6 +435,9 @@ const summarizeEnding = (state) => {
     }
     if (state.grandmotherUntied && state.factionAffinity === "woodcutter") {
         return "You survive the forest by siding with force, but the cost is bitter: the woods fall silent under the axe, and memory refuses to be healed.";
+    }
+    if (state.factionAffinity === "forest" && state.warnedWoodcutter) {
+        return "The forest and the woodcutter collide at the cottage door. You stand between them in the threshold of a new story, where the wolf is not merely a monster but a guardian with a claim to the land.";
     }
     if (state.grandmotherWellness >= 85) {
         return "The basket succeeds, and the remedies carry the day. Red leaves the cottage with a gentler understanding of the forest and the danger it keeps.";
@@ -724,7 +736,9 @@ const runCommand = async (userId, command) => {
     const chaosOutcome = await evaluateChaosRules(state);
 
     if (state.location === "cottage_interior" && !state.wolfSubdued) {
-        if (chaosOutcome === "preemptive_woodcutter_rescue") {
+        if (chaosOutcome === "standoff") {
+            narrativeResponse += "\n\n[PROLOG OUTCOME: STANDOFF]\nThe wolf has the forest at his back, but the woodcutter is already at the cottage door. You stand between predator and logger in the threshold of the old bargain. The final choice is no longer about a simple rescue—it is about who keeps the forest alive when the story turns on you.";
+        } else if (chaosOutcome === "preemptive_woodcutter_rescue") {
             state = applyTransition(state, subdueWolfAndRescue);
             narrativeResponse += "\n\n[PROLOG OUTCOME: PREEMPTIVE RESCUE]\nBecause you warned the woodcutter in the forest, he was already standing guard outside! The moment you question the disguised wolf, he bursts in with his trusty axe and subdues the predator! Type 'open closet' to free Grandmother.";
         } else if (chaosOutcome === "classic_woodcutter_rescue") {
