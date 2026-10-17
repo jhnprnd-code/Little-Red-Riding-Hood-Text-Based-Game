@@ -110,7 +110,7 @@ export default function App() {
     if (!gs) return null;
     const { chaosOutcome, factionAffinity, grandmotherUntied, grandmotherWellness, wolfSubdued } = gs;
     if (chaosOutcome === 'peaceful_visit') {
-      return 'CHAPTER SUMMARY — The forest holds. You preserve the path, keep the bargain of the woods, and leave the cottage in a state of uneasy calm.';
+      return 'CHAPTER SUMMARY — You preserve the path, keep the bargain of the woods, and leave the cottage in a state of uneasy calm.';
     }
     if (chaosOutcome === 'preemptive_woodcutter_rescue' || chaosOutcome === 'classic_woodcutter_rescue' || grandmotherUntied) {
       return `CHAPTER SUMMARY — The cottage is no longer a lie. ${factionAffinity === 'forest' ? 'You stood with the forest.' : factionAffinity === 'woodcutter' ? 'You stood with the ragged edge of survival.' : 'You chose the hard path between both.'} Wellness: ${grandmotherWellness}%.`;
