@@ -43,6 +43,7 @@ const LEXICON = Object.freeze({
         deer:        ['deer', 'fawn', 'creatures', 'animals'],
         birds:       ['bird', 'birds'],
         trees:       ['tree', 'trees', 'oak', 'pine'],
+        roots:       ['root', 'roots', 'moss', 'stump', 'stumps'],
         spectacles:  ['spectacle', 'spectacles', 'glasses', 'snout'],
         eyes:        ['eye', 'eyes'],
         ears:        ['ear', 'ears'],

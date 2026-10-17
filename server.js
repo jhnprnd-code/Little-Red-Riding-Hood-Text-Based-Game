@@ -67,7 +67,8 @@ const dbReady = new Promise((resolve, reject) => {
                 loop_count INTEGER DEFAULT 0,
                 memory_fragments TEXT DEFAULT '[]',
                 spectacles_taken INTEGER DEFAULT 0,
-                grandmother_mystic INTEGER DEFAULT 0
+                grandmother_mystic INTEGER DEFAULT 0,
+                standoff_choice TEXT DEFAULT NULL
             )
         `, async (err) => {
             if (err) return reject(err);
@@ -77,6 +78,7 @@ const dbReady = new Promise((resolve, reject) => {
                 await ensureColumn('player_sessions_v3', 'memory_fragments', "TEXT DEFAULT '[]'");
                 await ensureColumn('player_sessions_v3', 'spectacles_taken', 'INTEGER DEFAULT 0');
                 await ensureColumn('player_sessions_v3', 'grandmother_mystic', 'INTEGER DEFAULT 0');
+                await ensureColumn('player_sessions_v3', 'standoff_choice', 'TEXT DEFAULT NULL');
                 db.run(`
                     CREATE TABLE IF NOT EXISTS chaos_logs (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -118,7 +120,8 @@ const getPlayerStateFromDB = (userId) =>
                 loopCount: Number(row.loop_count || 0),
                 memoryFragments: Object.freeze(safeJsonParse(row.memory_fragments, [])),
                 spectaclesTaken: Boolean(row.spectacles_taken),
-                grandmotherMystic: Boolean(row.grandmother_mystic)
+                grandmotherMystic: Boolean(row.grandmother_mystic),
+                standoffChoice: row.standoff_choice || null
             }));
         });
     });
@@ -130,8 +133,8 @@ const savePlayerStateToDB = (userId, s, outcome) =>
             forest_delay, hummed_tune, warned_woodcutter, commotion_level, clues_noticed,
             clues_seen, wolf_subdued, grandmother_untied, grandmother_wellness,
             inventory, chaos_outcome, faction_affinity, loop_count, memory_fragments,
-            spectacles_taken, grandmother_mystic
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            spectacles_taken, grandmother_mystic, standoff_choice
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `, [
         userId, s.location,
         s.stayedOnPath ? 1 : 0, s.talkedToWolf ? 1 : 0, s.revealedDestination ? 1 : 0,
@@ -140,7 +143,7 @@ const savePlayerStateToDB = (userId, s, outcome) =>
         s.wolfSubdued ? 1 : 0, s.grandmotherUntied ? 1 : 0, s.grandmotherWellness,
         JSON.stringify(s.inventory), outcome, s.factionAffinity || "neutral",
         s.loopCount || 0, JSON.stringify(s.memoryFragments), s.spectaclesTaken ? 1 : 0,
-        s.grandmotherMystic ? 1 : 0
+        s.grandmotherMystic ? 1 : 0, s.standoffChoice || null
     ]);
 
 // Serialize requests per player so read-modify-write cycles never interleave
@@ -216,6 +219,10 @@ const forestEntities = {
     deer: new ForestDetail("deer", "Deer grazing peacefully in the sun-dappled forest clearings.", true),
     birds: new ForestDetail("birds", "Woodland birds chirping melodiously in the canopy above.", false),
     trees: new ForestDetail("trees", "Tall, ancient trees casting long shadows across the meandering path.", false),
+    roots: new ForestDetail("roots", "The roots of the ancient oaks are exposed like knotted fingers, and beneath them you find faint moon-silver writing etched into the earth.", false),
+    stump: new ForestDetail("stump", "A freshly cut oak stump still dripping sap. Someone has been taking more than the forest can replace.", false),
+    oak: new ForestDetail("oak", "The central oak is older than the village. It carries the silence of a guardian who has seen too many winters.", false),
+    moss: new GameEntity("moss", "A patch of moss glows faintly under the roots, as if the forest is trying to leave a trail for you."),
     spectacles: new GameEntity("spectacles", "Grandmother's spectacles, resting awkwardly on a suspiciously large snout."),
     closet: new GameEntity("closet", "A sturdy wooden closet in the corner of the cottage.")
 };
@@ -288,7 +295,8 @@ const createInitialState = (previousState = null) => Object.freeze({
     loopCount: previousState ? previousState.loopCount + 1 : 0,
     memoryFragments: Object.freeze(previousState ? [...previousState.memoryFragments] : []),
     spectaclesTaken: false,
-    grandmotherMystic: false
+    grandmotherMystic: false,
+    standoffChoice: null
 });
 
 const applyTransition = (currentState, updaterFn) => Object.freeze(updaterFn({ ...currentState }));
@@ -430,6 +438,15 @@ const describeLocation = (state, priorOutcome) => {
 };
 
 const summarizeEnding = (state) => {
+    if (state.standoffChoice === "wolf") {
+        return "You choose the wolf and the forest. The axe falls short of the old oath, and the woods breathe again as a living thing rather than a cut-down ruin.";
+    }
+    if (state.standoffChoice === "woodcutter") {
+        return "You choose the woodcutter, and the forest pays for it with silence. The trees do not forgive a blade that was already raised too early.";
+    }
+    if (state.standoffChoice === "grandmother") {
+        return "You choose to protect grandmother and the fragile boundary between fear and mercy. The forest does not bow, but it lets the day end without a blood sacrifice.";
+    }
     if (state.grandmotherUntied && state.factionAffinity === "forest") {
         return "You break the loop by refusing the woodcutter's greed and listening to the forest itself. The old cottage is no longer a trap, but a threshold.";
     }
@@ -457,6 +474,9 @@ const describeEnvironmentalLore = (state) => {
     if (state.spectaclesTaken) {
         base.push("The spectacles reveal the forest's hidden script: a lattice of old runes, family marks, and warnings written in moonlight.");
     }
+    if (state.location === "forest_path") {
+        base.push("Near the roots, a trail of pale moss and stripped bark suggests the forest has been leaving clues for someone who knows how to read them.");
+    }
     if (state.factionAffinity === "forest") {
         base.push("You begin to hear the forest as a voice, not a threat.");
     }
@@ -478,6 +498,37 @@ const revealGrandmotherMystic = (state) => {
 const goToCottage = (state) => {
     const s = applyTransition(state, moveTo("cottage_exterior"));
     return { state: s, text: worldMap.cottage_exterior.examine() };
+};
+
+const resolveStandoffChoice = (command, state) => {
+    if (state.location !== "cottage_interior" || state.standoffChoice !== null) return null;
+    const text = command.toLowerCase();
+    if (text.includes("help wolf") || text.includes("stand with wolf") || text.includes("choose wolf") || text.includes("side with wolf") || text.includes("protect forest") || text.includes("help the wolf")) return "wolf";
+    if (text.includes("help woodcutter") || text.includes("stand with woodcutter") || text.includes("choose woodcutter") || text.includes("side with woodcutter") || text.includes("help the woodcutter") || text.includes("let the woodcutter in")) return "woodcutter";
+    if (text.includes("protect grandmother") || text.includes("save grandmother") || text.includes("protect the grandmother") || text.includes("guard grandmother") || text.includes("choose grandmother")) return "grandmother";
+    return null;
+};
+
+const handleStandoffChoice = (state, choice) => {
+    const memoryMap = {
+        wolf: "You choose the wolf and the forest. The old oath is not a lie: the woodcutter is the threat, not the guardian.",
+        woodcutter: "You choose the axe and the road to survival. The forest remembers this choice as a wound.",
+        grandmother: "You choose to protect grandmother. You will not let the forest or the axe claim her life tonight."
+    };
+    const nextState = applyTransition(state, st => ({
+        ...st,
+        standoffChoice: choice,
+        factionAffinity: choice === "grandmother" ? "neutral" : (choice === "woodcutter" ? "woodcutter" : "forest"),
+        memoryFragments: Object.freeze([...st.memoryFragments, memoryMap[choice]])
+    }));
+    return {
+        state: nextState,
+        text: choice === "wolf"
+            ? "You step between the wolf and the woodcutter, and the forest stirs around you. The wolf is not the enemy tonight; the hunger in the axe is."
+            : choice === "woodcutter"
+                ? "You call the woodcutter in and let the axe settle the matter. The forest recoils, and the day's old bargain breaks under steel."
+                : "You protect grandmother and keep the threshold closed. The wolf retreats, the woodcutter is forced back, and the night ends without another death."
+    };
 };
 
 const handlers = {
@@ -686,9 +737,10 @@ const handlers = {
         text: [
             "Available Commands:",
             "• Sensory & Exploration: 'look around', 'listen', 'smell', 'hum tune', 'examine basket', 'examine cloak'",
-            "• Forest Interactions: 'watch squirrels/rabbits/deer', 'talk to woodcutter', 'talk to wolf', 'wander off path'",
+            "• Forest Interactions: 'watch squirrels/rabbits/deer', 'watch roots', 'watch oak', 'talk to woodcutter', 'talk to wolf', 'wander off path'",
             "• Movement: 'walk to cottage', 'go back'",
             "• Cottage Progression: 'lift latch', 'examine spectacles', 'wear spectacles', 'examine eyes/ears/teeth'",
+            "• Standoff Choices: 'choose wolf', 'choose woodcutter', 'protect grandmother'",
             "• Resolution: 'open closet', 'untie grandmother', 'give basket'"
         ].join("\n")
     })
@@ -721,10 +773,23 @@ const runCommand = async (userId, command) => {
         };
     }
 
+    let narrativeResponse = "Unrecognized command. Type 'help' to see all supported commands.";
+
+    const standoffChoice = resolveStandoffChoice(command, state);
+    if (standoffChoice && priorOutcome === "standoff") {
+        const result = handleStandoffChoice(state, standoffChoice);
+        const chaosOutcome = "standoff";
+        narrativeResponse = result.text + `\n\n[CHOICE: ${standoffChoice.toUpperCase()}]`;
+        state = result.state;
+        await savePlayerStateToDB(userId, state, chaosOutcome);
+        runSQL(`INSERT INTO chaos_logs (user_id, command, resulting_outcome) VALUES (?, ?, ?)`,
+            [userId, command, chaosOutcome]).catch(err => console.error("chaos_logs insert failed:", err.message));
+        return { response: narrativeResponse, chaosOutcome, state, mlTelemetry };
+    }
+
     // "back" is a target in the lexicon, so "go back" / "return" work with any verb.
     const key = target === "back" ? "back" : verb;
     const handler = handlers[key];
-    let narrativeResponse = "Unrecognized command. Type 'help' to see all supported commands.";
 
     if (resolved && handler) {
         const result = await handler({ state, target, priorOutcome });
