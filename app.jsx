@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 
 // Use the same host the page was served from, so demo-ing from another machine works.
 // Override with window.__API__ if the server lives elsewhere.
