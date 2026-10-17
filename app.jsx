@@ -106,6 +106,23 @@ export default function App() {
   };
 
   const gs = gameState;
+  const chapterSummary = (() => {
+    if (!gs) return null;
+    const { chaosOutcome, factionAffinity, grandmotherUntied, grandmotherWellness, wolfSubdued } = gs;
+    if (chaosOutcome === 'peaceful_visit') {
+      return 'CHAPTER SUMMARY — The forest holds. You preserve the path, keep the bargain of the woods, and leave the cottage in a state of uneasy calm.';
+    }
+    if (chaosOutcome === 'preemptive_woodcutter_rescue' || chaosOutcome === 'classic_woodcutter_rescue' || grandmotherUntied) {
+      return `CHAPTER SUMMARY — The cottage is no longer a lie. ${factionAffinity === 'forest' ? 'You stood with the forest.' : factionAffinity === 'woodcutter' ? 'You stood with the ragged edge of survival.' : 'You chose the hard path between both.'} Wellness: ${grandmotherWellness}%.`;
+    }
+    if (chaosOutcome === 'wolf_overwhelms_red') {
+      return 'CHAPTER SUMMARY — The loop closes. The forest remembers your failure, and the path opens again for another attempt.';
+    }
+    if (wolfSubdued) {
+      return 'CHAPTER SUMMARY — The wolf is subdued, but the land remains haunted by the old bargain between fear, hunger, and memory.';
+    }
+    return 'CHAPTER SUMMARY — The day remains unresolved. The forest is watching, and it has not finished speaking yet.';
+  })();
 
   return (
     <div style={styles.container}>
@@ -214,6 +231,24 @@ export default function App() {
             <p><strong>Hummed Tune:</strong> {gs ? String(gs.hummedTune) : 'false'}</p>
             <p><strong>Warned Woodcutter:</strong> {gs ? String(gs.warnedWoodcutter) : 'false'}</p>
             <p><strong>Grandmother Free:</strong> {gs ? String(gs.grandmotherUntied) : 'false'}</p>
+          </div>
+
+          <div style={styles.card}>
+            <h3 style={styles.cardTitle}>Chapter Summary</h3>
+            <p style={{ margin: 0, color: '#f2d27a', lineHeight: 1.6 }}>{chapterSummary || 'The chapter has not concluded yet.'}</p>
+          </div>
+
+          <div style={styles.card}>
+            <h3 style={styles.cardTitle}>Loop Memories</h3>
+            {(gs && gs.memoryFragments && gs.memoryFragments.length > 0) ? (
+              <ul style={styles.list}>
+                {gs.memoryFragments.map((fragment, i) => (
+                  <li key={i}>{fragment}</li>
+                ))}
+              </ul>
+            ) : (
+              <p style={{ margin: 0, color: '#8b949e' }}>No memories yet. The woods are still waiting to reveal themselves.</p>
+            )}
           </div>
 
           <div style={styles.card}>

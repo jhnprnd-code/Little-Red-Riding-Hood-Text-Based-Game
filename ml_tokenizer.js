@@ -26,6 +26,8 @@ const LEXICON = Object.freeze({
         walk:    ['walk', 'walking', 'go', 'going', 'travel', 'proceed', 'continue', 'run', 'head'],
         open:    ['open', 'opening', 'lift', 'lifting', 'knock', 'knocking', 'unlock', 'untie', 'free', 'enter'],
         give:    ['give', 'giving', 'deliver', 'hand', 'share', 'heal', 'feed', 'offer', 'use'],
+        wear:    ['wear', 'wearing', 'put', 'putting', 'don', 'donning'],
+        take:    ['take', 'taking', 'steal', 'stealing', 'grab', 'grabbing', 'lift', 'lifting'],
         hum:     ['hum', 'humming', 'sing', 'singing', 'whistle', 'melody', 'tune'],
         listen:  ['listen', 'listening', 'hear', 'hearing', 'sound'],
         smell:   ['smell', 'smelling', 'sniff', 'sniffing', 'scent', 'aroma'],

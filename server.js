@@ -416,7 +416,42 @@ const LOOK_AROUND = new Set(["around", "path", "cottage"]);
 const describeLocation = (state, priorOutcome) => {
     const loc = worldMap[state.location];
     const friendly = priorOutcome === "peaceful_visit" || state.grandmotherUntied;
-    return friendly && loc.peacefulDescription ? loc.peacefulDescription : loc.examine();
+    const base = friendly && loc.peacefulDescription ? loc.peacefulDescription : loc.examine();
+    return `${base}\n\n${describeEnvironmentalLore(state)}`;
+};
+
+const summarizeEnding = (state) => {
+    if (state.grandmotherUntied && state.factionAffinity === "forest") {
+        return "You break the loop by refusing the woodcutter's greed and listening to the forest itself. The old cottage is no longer a trap, but a threshold.";
+    }
+    if (state.grandmotherUntied && state.factionAffinity === "woodcutter") {
+        return "You survive the forest by siding with force, but the cost is bitter: the woods fall silent under the axe, and memory refuses to be healed.";
+    }
+    if (state.grandmotherWellness >= 85) {
+        return "The basket succeeds, and the remedies carry the day. Red leaves the cottage with a gentler understanding of the forest and the danger it keeps.";
+    }
+    if (state.wolfSubdued) {
+        return "The wolf is subdued, the cottage is saved, but the truth of the forest remains unsettled. The day ends in survival, not peace.";
+    }
+    return "The day ends in silence. Even as the path reopens, the forest still remembers every failed version of this story.";
+};
+
+const describeEnvironmentalLore = (state) => {
+    const base = [
+        "The forest carries more than weather; it carries memory.",
+        "Rosemary and iron hang in the air whenever the cottage is near.",
+        "Every tree seems to listen, and every clearing keeps a secret."
+    ];
+    if (state.spectaclesTaken) {
+        base.push("The spectacles reveal the forest's hidden script: a lattice of old runes, family marks, and warnings written in moonlight.");
+    }
+    if (state.factionAffinity === "forest") {
+        base.push("You begin to hear the forest as a voice, not a threat.");
+    }
+    if (state.factionAffinity === "woodcutter") {
+        base.push("The woodcutter's hunger has marked the land itself, and the forest recoils from every chopped trunk.");
+    }
+    return base.join("\n");
 };
 
 const revealGrandmotherMystic = (state) => {
@@ -612,12 +647,28 @@ const handlers = {
             return {
                 state: s,
                 text: `You hand over the freshly baked bread, sweet wine, sweet cakes, and herbal remedies. Grandmother's spirits and health soar! Final UN SDG Goal 3 Wellness Score: ${s.grandmotherWellness}%!` +
-                    (perfect ? "" : "\nA perfect 100% needs the clean route: stay on the path, never speak to the stranger, and arrive before the wolf does.")
+                    (perfect ? "" : "\nA perfect 100% needs the clean route: stay on the path, never speak to the stranger, and arrive before the wolf does.") +
+                    `\n\n${summarizeEnding(s)}`
             };
         }
         if (state.wolfSubdued) return { text: "Grandmother is still tied up in the closet! Free her first." };
         return { text: "Something feels dangerously wrong with the figure in the bed! Examine her 'eyes', 'ears', or 'teeth' first." };
     },
+
+    wear: ({ state, target }) => {
+        if (target !== "spectacles") return { text: "You can only wear the enchanted spectacles." };
+        if (!state.spectaclesTaken) return { text: "The spectacles are not in your possession yet." };
+        const s = applyTransition(state, st => ({
+            ...st,
+            memoryFragments: Object.freeze([...st.memoryFragments, "Wearing the spectacles reveals hidden truths in the world as though it were writing in moonlight."])
+        }));
+        return {
+            state: s,
+            text: "You set the enchanted spectacles on your face. The world sharpens into pale glyphs and hidden paths; the cottage seems less like a home and more like a riddle the forest has been trying to solve for years."
+        };
+    },
+
+    take: ({ state, target }) => handlers.wear({ state, target }),
 
     help: () => ({
         text: [
@@ -625,7 +676,7 @@ const handlers = {
             "• Sensory & Exploration: 'look around', 'listen', 'smell', 'hum tune', 'examine basket', 'examine cloak'",
             "• Forest Interactions: 'watch squirrels/rabbits/deer', 'talk to woodcutter', 'talk to wolf', 'wander off path'",
             "• Movement: 'walk to cottage', 'go back'",
-            "• Cottage Progression: 'lift latch', 'examine spectacles', 'examine eyes/ears/teeth'",
+            "• Cottage Progression: 'lift latch', 'examine spectacles', 'wear spectacles', 'examine eyes/ears/teeth'",
             "• Resolution: 'open closet', 'untie grandmother', 'give basket'"
         ].join("\n")
     })
