@@ -205,6 +205,8 @@ export default function App() {
             <h3 style={styles.cardTitle}>Prolog Chaos Engine</h3>
             <p><strong>Active Timeline:</strong> <span style={styles.badge}>{chaosOutcome}</span></p>
             <p><strong>Location:</strong> {gs ? gs.location : 'forest_path'}</p>
+            <p><strong>Faction:</strong> {gs ? (gs.factionAffinity || 'neutral') : 'neutral'}</p>
+            <p><strong>Loop Count:</strong> {gs ? gs.loopCount : 0}</p>
             <p><strong>Stayed on Path:</strong> {gs ? String(gs.stayedOnPath) : 'true'}</p>
             <p><strong>Talked to Wolf:</strong> {gs ? String(gs.talkedToWolf) : 'false'}</p>
             <p><strong>Clues Noticed:</strong> {gs ? gs.cluesNoticed : 0} / 3</p>

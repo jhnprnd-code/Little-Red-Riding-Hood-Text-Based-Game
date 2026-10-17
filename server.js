@@ -13,6 +13,16 @@ const DEFAULT_USER = "red_player_1";
 const USER_ID_RE = /^[A-Za-z0-9_-]{1,40}$/;
 const MAX_COMMAND_LENGTH = 200;
 
+const safeJsonParse = (raw, fallback = []) => {
+    if (raw === null || raw === undefined || raw === "") return fallback;
+    try {
+        const parsed = JSON.parse(raw);
+        return Array.isArray(parsed) ? parsed : fallback;
+    } catch {
+        return fallback;
+    }
+};
+
 // ============================================================================
 // DATABASE LAYER
 // ============================================================================
@@ -20,6 +30,18 @@ const db = new sqlite3.Database(path.join(__dirname, 'game_data.db'));
 
 const runSQL = (sql, params = []) =>
     new Promise((resolve, reject) => db.run(sql, params, (err) => (err ? reject(err) : resolve())));
+
+const ensureColumn = (table, columnName, columnDef) =>
+    new Promise((resolve, reject) => {
+        db.all(`PRAGMA table_info(${table})`, (err, columns) => {
+            if (err) return reject(err);
+            if (columns.some(column => column.name === columnName)) return resolve();
+            db.run(`ALTER TABLE ${table} ADD COLUMN ${columnName} ${columnDef}`, (alterErr) => {
+                if (alterErr) return reject(alterErr);
+                resolve();
+            });
+        });
+    });
 
 const dbReady = new Promise((resolve, reject) => {
     db.serialize(() => {
@@ -40,18 +62,34 @@ const dbReady = new Promise((resolve, reject) => {
                 grandmother_untied INTEGER,
                 grandmother_wellness INTEGER,
                 inventory TEXT,
-                chaos_outcome TEXT
+                chaos_outcome TEXT,
+                faction_affinity TEXT DEFAULT 'neutral',
+                loop_count INTEGER DEFAULT 0,
+                memory_fragments TEXT DEFAULT '[]',
+                spectacles_taken INTEGER DEFAULT 0,
+                grandmother_mystic INTEGER DEFAULT 0
             )
-        `);
-        db.run(`
-            CREATE TABLE IF NOT EXISTS chaos_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id TEXT,
-                command TEXT,
-                resulting_outcome TEXT,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            )
-        `, (err) => (err ? reject(err) : resolve()));
+        `, async (err) => {
+            if (err) return reject(err);
+            try {
+                await ensureColumn('player_sessions_v3', 'faction_affinity', "TEXT DEFAULT 'neutral'");
+                await ensureColumn('player_sessions_v3', 'loop_count', 'INTEGER DEFAULT 0');
+                await ensureColumn('player_sessions_v3', 'memory_fragments', "TEXT DEFAULT '[]'");
+                await ensureColumn('player_sessions_v3', 'spectacles_taken', 'INTEGER DEFAULT 0');
+                await ensureColumn('player_sessions_v3', 'grandmother_mystic', 'INTEGER DEFAULT 0');
+                db.run(`
+                    CREATE TABLE IF NOT EXISTS chaos_logs (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        user_id TEXT,
+                        command TEXT,
+                        resulting_outcome TEXT,
+                        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                    )
+                `, (tableErr) => (tableErr ? reject(tableErr) : resolve()));
+            } catch (migrationErr) {
+                reject(migrationErr);
+            }
+        });
     });
 });
 
@@ -70,11 +108,17 @@ const getPlayerStateFromDB = (userId) =>
                 warnedWoodcutter: Boolean(row.warned_woodcutter),
                 commotionLevel: row.commotion_level,
                 cluesNoticed: row.clues_noticed,
-                cluesSeen: Object.freeze(JSON.parse(row.clues_seen)),
+                cluesSeen: Object.freeze(safeJsonParse(row.clues_seen, [])),
                 wolfSubdued: Boolean(row.wolf_subdued),
                 grandmotherUntied: Boolean(row.grandmother_untied),
                 grandmotherWellness: row.grandmother_wellness,
-                inventory: Object.freeze(JSON.parse(row.inventory))
+                inventory: Object.freeze(safeJsonParse(row.inventory, basketItems.map(item => item.name))),
+                chaosOutcome: row.chaos_outcome,
+                factionAffinity: row.faction_affinity || "neutral",
+                loopCount: Number(row.loop_count || 0),
+                memoryFragments: Object.freeze(safeJsonParse(row.memory_fragments, [])),
+                spectaclesTaken: Boolean(row.spectacles_taken),
+                grandmotherMystic: Boolean(row.grandmother_mystic)
             }));
         });
     });
@@ -85,15 +129,18 @@ const savePlayerStateToDB = (userId, s, outcome) =>
             user_id, location, stayed_on_path, talked_to_wolf, revealed_destination,
             forest_delay, hummed_tune, warned_woodcutter, commotion_level, clues_noticed,
             clues_seen, wolf_subdued, grandmother_untied, grandmother_wellness,
-            inventory, chaos_outcome
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            inventory, chaos_outcome, faction_affinity, loop_count, memory_fragments,
+            spectacles_taken, grandmother_mystic
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `, [
         userId, s.location,
         s.stayedOnPath ? 1 : 0, s.talkedToWolf ? 1 : 0, s.revealedDestination ? 1 : 0,
         s.forestDelay, s.hummedTune ? 1 : 0, s.warnedWoodcutter ? 1 : 0,
         s.commotionLevel, s.cluesNoticed, JSON.stringify(s.cluesSeen),
         s.wolfSubdued ? 1 : 0, s.grandmotherUntied ? 1 : 0, s.grandmotherWellness,
-        JSON.stringify(s.inventory), outcome
+        JSON.stringify(s.inventory), outcome, s.factionAffinity || "neutral",
+        s.loopCount || 0, JSON.stringify(s.memoryFragments), s.spectaclesTaken ? 1 : 0,
+        s.grandmotherMystic ? 1 : 0
     ]);
 
 // Serialize requests per player so read-modify-write cycles never interleave
@@ -176,13 +223,13 @@ const forestEntities = {
 const npcs = {
     wolf: new NPC(
         "wolf",
-        "A cunning wolf with gleaming eyes hiding sinister intentions behind a friendly facade.",
-        '"Where are you going, Little Red Riding Hood? And where does your grandmother live?" he asks sweetly.'
+        "A wolf with iron-gray fur and a lean, watchful frame—a displaced guardian of the deep woods rather than a simple monster.",
+        '"Where are you bound, child? Your grandmother keeps strange hours. If the forest remembers, it remembers her."'
     ),
     woodcutter: new NPC(
         "woodcutter",
-        "A brave woodcutter working nearby in the forest, wielding a trusty axe honed from years of labor.",
-        '"Be careful on the path, little one. My sharp ears are always listening if you need help."'
+        "A hard-faced logger with a bloodstained axe and a greedy stare fixed on the ancient oak canopy; he is stripping the forest faster than it can recover.",
+        '"Keep your eyes open, girl. The woods are not sacred to me—only the timber that pays."'
     )
 };
 
@@ -222,7 +269,7 @@ const worldMap = {
 const WELLNESS_START = 35;
 const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
 
-const createInitialState = () => Object.freeze({
+const createInitialState = (previousState = null) => Object.freeze({
     location: "forest_path",
     stayedOnPath: true,
     talkedToWolf: false,
@@ -236,15 +283,25 @@ const createInitialState = () => Object.freeze({
     wolfSubdued: false,
     grandmotherUntied: false,
     grandmotherWellness: WELLNESS_START,
-    inventory: Object.freeze(basketItems.map(item => item.name))
+    inventory: Object.freeze(basketItems.map(item => item.name)),
+    factionAffinity: "neutral",
+    loopCount: previousState ? previousState.loopCount + 1 : 0,
+    memoryFragments: Object.freeze(previousState ? [...previousState.memoryFragments] : []),
+    spectaclesTaken: false,
+    grandmotherMystic: false
 });
 
 const applyTransition = (currentState, updaterFn) => Object.freeze(updaterFn({ ...currentState }));
 
+const rememberFragment = (fragment) => (state) => {
+    if (!fragment || state.memoryFragments.includes(fragment)) return state;
+    return { ...state, memoryFragments: Object.freeze([...state.memoryFragments, fragment]) };
+};
+
 const lingerInWoods = (state) => ({ ...state, stayedOnPath: false, forestDelay: state.forestDelay + 1 });
 const humMelody = (state) => ({ ...state, hummedTune: true, commotionLevel: state.commotionLevel + 1 });
-const alertWoodcutter = (state) => ({ ...state, warnedWoodcutter: true });
-const speakToStranger = (state) => ({ ...state, talkedToWolf: true, revealedDestination: true });
+const alertWoodcutter = (state) => ({ ...state, warnedWoodcutter: true, factionAffinity: "woodcutter" });
+const speakToStranger = (state) => ({ ...state, talkedToWolf: true, revealedDestination: true, factionAffinity: "forest" });
 const moveTo = (location) => (state) => ({ ...state, location });
 
 // Each clue (eyes / ears / teeth) counts once; the count is derived from the set.
@@ -271,10 +328,16 @@ const deliverRemedies = (state, items) => {
     const boost = items
         .filter(item => state.inventory.includes(item.name))
         .reduce((sum, item) => sum + item.wellnessPoints, 0);
+    const magicalBoost = state.grandmotherMystic && state.inventory.includes("remedies") ? 10 : 0;
+    const spectacleBoost = state.spectaclesTaken ? 5 : 0;
     return {
         ...state,
-        grandmotherWellness: clamp(state.grandmotherWellness + boost - deliveryPenalty(state), 0, 100),
-        inventory: Object.freeze([])
+        grandmotherWellness: clamp(state.grandmotherWellness + boost + magicalBoost + spectacleBoost - deliveryPenalty(state), 0, 100),
+        inventory: Object.freeze([]),
+        memoryFragments: Object.freeze([
+            ...state.memoryFragments,
+            "The remedies were never ordinary medicine; they were a key to the forest's oldest bargains."
+        ])
     };
 };
 
@@ -356,6 +419,15 @@ const describeLocation = (state, priorOutcome) => {
     return friendly && loc.peacefulDescription ? loc.peacefulDescription : loc.examine();
 };
 
+const revealGrandmotherMystic = (state) => {
+    if (state.grandmotherMystic) return state;
+    return {
+        ...state,
+        grandmotherMystic: true,
+        memoryFragments: Object.freeze([...state.memoryFragments, "Grandmother is not merely old; she is a hidden witch."])
+    };
+};
+
 const goToCottage = (state) => {
     const s = applyTransition(state, moveTo("cottage_exterior"));
     return { state: s, text: worldMap.cottage_exterior.examine() };
@@ -407,6 +479,18 @@ const handlers = {
                     : "Your basket contains:\n" + items.map(i => `• ${i.name.toUpperCase()}: ${i.examine()}`).join("\n")
             };
         }
+        if (inCottage && target === "spectacles") {
+            const s = applyTransition(state, st => ({
+                ...st,
+                spectaclesTaken: true,
+                inventory: Object.freeze([...st.inventory.filter(item => item !== "spectacles"), "spectacles"]),
+                memoryFragments: Object.freeze([...st.memoryFragments, "The spectacles were enchanted and left in the wolf's snout."])
+            }));
+            return {
+                state: s,
+                text: "The spectacles are impossibly warm, as though they absorb the moonlight. You slip them into your pocket, and the world seems to sharpen around you—hidden marks and strange sigils ripple across the room."
+            };
+        }
         if (inCottage && CLUES.has(target)) {
             if (peaceful) return { text: `Grandmother smiles warmly. Her ${target} look perfectly ordinary—nothing amiss at all.` };
             if (state.wolfSubdued) return { text: "The wolf has been subdued. There's nothing more to learn from the bed." };
@@ -423,7 +507,11 @@ const handlers = {
             if (peaceful) return { text: "Grandmother beams at you from her bed, a little pale from her cold but perfectly herself." };
             if (state.grandmotherUntied) return { text: "Grandmother is free, safe, and holding your hand." };
             if (state.wolfSubdued) return { text: "The subdued wolf lies where the 'Grandmother' once was. The real one is in the closet!" };
-            return { text: "The figure in the bed looks much larger and more disheveled than you remember. Try examining her 'eyes', 'ears', or 'teeth'." };
+            const s = applyTransition(state, revealGrandmotherMystic);
+            return {
+                state: s,
+                text: "The figure in the bed is far too large and raw-boned to be your Grandmother. Her skin is threaded with old sigils, and the cottage smells faintly of moss, iron, and rosemary. She is not merely ill—she is a hidden witch, exiled and mistrusted by the forest itself."
+            };
         }
         if (forestEntities[target]) return { text: forestEntities[target].examine() };
         if (npcs[target]) return { text: npcs[target].examine() };
@@ -435,14 +523,14 @@ const handlers = {
         if (state.location !== "forest_path") return { text: "There is no one here to talk to." };
         if (target === "wolf") {
             return {
-                state: applyTransition(state, speakToStranger),
-                text: `${npcs.wolf.speak()}\nOblivious to the danger, you reply, "I'm off to visit my grandmother and bring her some treats at her cottage on the other side of the forest."`
+                state: applyTransition(state, st => rememberFragment("The wolf is not merely hungry; he is guarding the forest.")(speakToStranger(st))),
+                text: `${npcs.wolf.speak()}\nOblivious to the danger, you reply, "I'm off to visit my grandmother and bring her some treats at her cottage on the other side of the forest."\nThe wolf's eyes sharpen with recognition. He knows where that cottage sits—and why the forest seems to recoil from it.`
             };
         }
         if (target === "woodcutter") {
             return {
-                state: applyTransition(state, alertWoodcutter),
-                text: `${npcs.woodcutter.speak()}\nThe woodcutter nods and promises to keep watch near Grandmother's cottage!`
+                state: applyTransition(state, st => rememberFragment("The woodcutter profits from the forest's ruin.")(alertWoodcutter(st))),
+                text: `${npcs.woodcutter.speak()}\nThe woodcutter grins with predatory confidence and promises to keep watch near Grandmother's cottage—so long as the tree-fall keeps paying.`
             };
         }
         return { text: "Specify who you want to talk to: 'talk to wolf' or 'talk to woodcutter'." };
@@ -563,7 +651,7 @@ const runCommand = async (userId, command) => {
     const priorOutcome = await evaluateChaosRules(state);
     if (priorOutcome === "wolf_overwhelms_red") {
         return {
-            response: "The wolf has already gotten you. Press 'Reset Timeline' to try again.",
+            response: `The wolf has already gotten you. Press 'Reset Timeline' to try again. ${state.loopCount > 0 ? `You remember the last loop: ${state.memoryFragments[state.memoryFragments.length - 1] || 'The forest keeps replaying its own lesson.'}` : 'The forest still feels strangely familiar.'}`,
             chaosOutcome: priorOutcome,
             state,
             mlTelemetry
@@ -603,7 +691,7 @@ const runCommand = async (userId, command) => {
     return { response: narrativeResponse, chaosOutcome, state, mlTelemetry };
 };
 
-const WELCOME_TEXT = "Welcome to LITTLE RED RIDING HOOD: CHAOS IN THE DEEP WOODS.\nYour mother hands you a basket of bread, sweet wine, sweet cakes, and herbal remedies for your ailing Grandmother.\n\"Stay on the path and avoid talking to strangers!\" she warns.\nType 'help' for commands, or 'look around' to begin.";
+const WELCOME_TEXT = "Welcome to LITTLE RED RIDING HOOD: CHAOS IN THE DEEP WOODS.\nYour mother hands you a basket of bread, sweet wine, sweet cakes, and herbal remedies for your ailing Grandmother.\n\"Stay on the path and avoid talking to strangers!\" she warns, but the words have the shape of an old omen.\nThis is not the first time the forest has swallowed this day.\nType 'help' for commands, or 'look around' to begin.";
 
 const resolveUserId = (raw) => {
     const userId = raw === undefined ? DEFAULT_USER : raw;
@@ -654,11 +742,15 @@ app.post('/api/reset', async (req, res) => {
     if (!userId) return badUser(res);
     try {
         await dbReady;
-        const initialState = createInitialState();
+        const previousState = await withUserLock(userId, () => getPlayerStateFromDB(userId));
+        const initialState = createInitialState(previousState);
         const outcome = await evaluateChaosRules(initialState);
         await withUserLock(userId, () => savePlayerStateToDB(userId, initialState, outcome));
+        const rememberText = previousState && previousState.memoryFragments.length
+            ? `You carry the memory of the previous loop: ${previousState.memoryFragments[previousState.memoryFragments.length - 1]}`
+            : "The day feels familiar, as though the forest itself is replaying a warning.";
         res.json({
-            response: "Timeline reset. Mother hands you the basket of bread, sweet wine, sweet cakes, and herbal remedies: 'Stay on the path and avoid talking to strangers!' Type 'help' for commands.",
+            response: `Timeline reset. The path opens again, but it does not feel new. ${rememberText}\nMother hands you the basket of bread, sweet wine, sweet cakes, and herbal remedies: 'Stay on the path and avoid talking to strangers!' Type 'help' for commands.`,
             chaosOutcome: outcome,
             state: initialState
         });
