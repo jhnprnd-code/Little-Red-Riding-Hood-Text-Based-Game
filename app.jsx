@@ -108,7 +108,10 @@ export default function App() {
   const gs = gameState;
   const chapterSummary = (() => {
     if (!gs) return null;
-    const { chaosOutcome, factionAffinity, grandmotherUntied, grandmotherWellness, wolfSubdued } = gs;
+    const { factionAffinity, grandmotherUntied, grandmotherWellness, wolfSubdued } = gs;
+    if (chaosOutcome === 'true_ending') {
+      return 'TRUE ENDING — Grandmother’s pact is fulfilled, the heart oak is spared, and the loop finally breaks.';
+    }
     if (chaosOutcome === 'peaceful_visit') {
       return 'CHAPTER SUMMARY — You preserve the path, keep the bargain of the woods, and leave the cottage in a state of uneasy calm.';
     }

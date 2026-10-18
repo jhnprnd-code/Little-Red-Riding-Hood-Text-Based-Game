@@ -68,7 +68,8 @@ const dbReady = new Promise((resolve, reject) => {
                 memory_fragments TEXT DEFAULT '[]',
                 spectacles_taken INTEGER DEFAULT 0,
                 grandmother_mystic INTEGER DEFAULT 0,
-                standoff_choice TEXT DEFAULT NULL
+                standoff_choice TEXT DEFAULT NULL,
+                pact_revealed INTEGER DEFAULT 0
             )
         `, async (err) => {
             if (err) return reject(err);
@@ -79,6 +80,7 @@ const dbReady = new Promise((resolve, reject) => {
                 await ensureColumn('player_sessions_v3', 'spectacles_taken', 'INTEGER DEFAULT 0');
                 await ensureColumn('player_sessions_v3', 'grandmother_mystic', 'INTEGER DEFAULT 0');
                 await ensureColumn('player_sessions_v3', 'standoff_choice', 'TEXT DEFAULT NULL');
+                await ensureColumn('player_sessions_v3', 'pact_revealed', 'INTEGER DEFAULT 0');
                 db.run(`
                     CREATE TABLE IF NOT EXISTS chaos_logs (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -121,7 +123,8 @@ const getPlayerStateFromDB = (userId) =>
                 memoryFragments: Object.freeze(safeJsonParse(row.memory_fragments, [])),
                 spectaclesTaken: Boolean(row.spectacles_taken),
                 grandmotherMystic: Boolean(row.grandmother_mystic),
-                standoffChoice: row.standoff_choice || null
+                standoffChoice: row.standoff_choice || null,
+                pactRevealed: Boolean(row.pact_revealed)
             }));
         });
     });
@@ -133,8 +136,8 @@ const savePlayerStateToDB = (userId, s, outcome) =>
             forest_delay, hummed_tune, warned_woodcutter, commotion_level, clues_noticed,
             clues_seen, wolf_subdued, grandmother_untied, grandmother_wellness,
             inventory, chaos_outcome, faction_affinity, loop_count, memory_fragments,
-            spectacles_taken, grandmother_mystic, standoff_choice
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            spectacles_taken, grandmother_mystic, standoff_choice, pact_revealed
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `, [
         userId, s.location,
         s.stayedOnPath ? 1 : 0, s.talkedToWolf ? 1 : 0, s.revealedDestination ? 1 : 0,
@@ -143,7 +146,7 @@ const savePlayerStateToDB = (userId, s, outcome) =>
         s.wolfSubdued ? 1 : 0, s.grandmotherUntied ? 1 : 0, s.grandmotherWellness,
         JSON.stringify(s.inventory), outcome, s.factionAffinity || "neutral",
         s.loopCount || 0, JSON.stringify(s.memoryFragments), s.spectaclesTaken ? 1 : 0,
-        s.grandmotherMystic ? 1 : 0, s.standoffChoice || null
+        s.grandmotherMystic ? 1 : 0, s.standoffChoice || null, s.pactRevealed ? 1 : 0
     ]);
 
 // Serialize requests per player so read-modify-write cycles never interleave
@@ -223,8 +226,8 @@ const forestEntities = {
     stump: new ForestDetail("stump", "A freshly cut oak stump still dripping sap. Someone has been taking more than the forest can replace.", false),
     oak: new ForestDetail("oak", "The central oak is older than the village. It carries the silence of a guardian who has seen too many winters.", false),
     moss: new GameEntity("moss", "A patch of moss glows faintly under the roots, as if the forest is trying to leave a trail for you."),
-    spectacles: new GameEntity("spectacles", "Grandmother's spectacles, resting awkwardly on a suspiciously large snout."),
-    closet: new GameEntity("closet", "A sturdy wooden closet in the corner of the cottage.")
+    spectacles: new GameEntity("spectacles", "Grandmother's spectacles, resting awkwardly on a suspiciously large snout. Tiny sigils are etched around the rims."),
+    closet: new GameEntity("closet", "A sturdy wooden closet in the corner of the cottage, its frame carved with the same old sigils.")
 };
 
 const npcs = {
@@ -296,7 +299,8 @@ const createInitialState = (previousState = null) => Object.freeze({
     memoryFragments: Object.freeze(previousState ? [...previousState.memoryFragments] : []),
     spectaclesTaken: false,
     grandmotherMystic: false,
-    standoffChoice: null
+    standoffChoice: null,
+    pactRevealed: false
 });
 
 const applyTransition = (currentState, updaterFn) => Object.freeze(updaterFn({ ...currentState }));
@@ -319,12 +323,20 @@ const noticeClue = (clue) => (state) => {
     return { ...state, cluesSeen, cluesNoticed: cluesSeen.length };
 };
 
-const subdueWolfAndRescue = (state) => ({ ...state, wolfSubdued: true });
+const subdueWolfAndRescue = (state) => ({
+    ...state,
+    wolfSubdued: true,
+    inventory: Object.freeze(state.inventory.filter(item => item !== "wine"))
+});
 
 const untieGrandmotherFromCloset = (state) => ({
     ...state,
     grandmotherUntied: true,
-    grandmotherWellness: clamp(state.grandmotherWellness + 10, 0, 100)
+    grandmotherWellness: clamp(state.grandmotherWellness + 10, 0, 100),
+    grandmotherMystic: true,
+    memoryFragments: state.grandmotherMystic
+        ? state.memoryFragments
+        : Object.freeze([...state.memoryFragments, "The real Grandmother is an exiled witch; her pact with the forest bound this day."])
 });
 
 const deliveryPenalty = (state) =>
@@ -341,7 +353,7 @@ const deliverRemedies = (state, items) => {
     return {
         ...state,
         grandmotherWellness: clamp(state.grandmotherWellness + boost + magicalBoost + spectacleBoost - deliveryPenalty(state), 0, 100),
-        inventory: Object.freeze([]),
+        inventory: Object.freeze(state.inventory.filter(item => !items.some(delivered => delivered.name === item))),
         memoryFragments: Object.freeze([
             ...state.memoryFragments,
             "The remedies were never ordinary medicine; they were a key to the forest's oldest bargains."
@@ -370,11 +382,20 @@ const CHAOS_RULES = `
     % A forest-aligned playthrough can end in a tense stand-off when the wolf and woodcutter meet at the cottage.
     standoff_at_cottage :- wolf_seeking_refuge, woodcutter_alerted.
 
+    % The loop ends only when Grandmother is free, her remedies are delivered,
+    % the pact is understood, and the wolf and woodcutter both accept its terms.
+    fulfilled_pact :- pact_revealed(true), grandmother_mystic(true),
+                      grandmother_untied(true), basket_delivered(true),
+                      standoff_choice(pact), faction_affinity(forest),
+                      wolf_subdued(false).
+
     preemptive_rescue :- wolf_infiltrated, warned_woodcutter(true), clues_noticed(N), N >= 1.
     classic_rescue    :- wolf_infiltrated, clues_noticed(N), N >= 3, woodcutter_alerted.
-    unrescued_ambush  :- wolf_infiltrated, clues_noticed(N), N >= 3, \\+ woodcutter_alerted.
+    unrescued_ambush  :- wolf_infiltrated, clues_noticed(N), N >= 3,
+                         \\+ woodcutter_alerted, faction_affinity(neutral).
     safe_reunion      :- \\+ wolf_infiltrated.
 
+    story_outcome(true_ending)                 :- fulfilled_pact, !.
     story_outcome(grandmother_saved_and_untied) :- grandmother_untied(true), !.
     story_outcome(standoff)                     :- standoff_at_cottage, !.
     story_outcome(preemptive_woodcutter_rescue) :- preemptive_rescue, !.
@@ -399,6 +420,11 @@ const evaluateChaosRules = (state) =>
             clues_noticed(${state.cluesNoticed}).
             grandmother_untied(${state.grandmotherUntied}).
             faction_affinity(${state.factionAffinity || 'neutral'}).
+            grandmother_mystic(${state.grandmotherMystic}).
+            pact_revealed(${state.pactRevealed}).
+            standoff_choice(${state.standoffChoice ? `'${state.standoffChoice}'` : 'none'}).
+            basket_delivered(${basketItems.every(item => !state.inventory.includes(item.name))}).
+            wolf_subdued(${state.wolfSubdued}).
         `;
         session.consult(facts + CHAOS_RULES, {
             success: () => {
@@ -438,6 +464,14 @@ const describeLocation = (state, priorOutcome) => {
 };
 
 const summarizeEnding = (state) => {
+    if (state.pactRevealed && state.grandmotherMystic && state.grandmotherUntied &&
+        basketItems.every(item => !state.inventory.includes(item.name)) && state.standoffChoice === "pact" &&
+        state.factionAffinity === "forest" && !state.wolfSubdued) {
+        return "TRUE ENDING — Grandmother's forest pact is fulfilled: she is free and healed, the wolf keeps his ancient charge, and the woodcutter accepts wine, lays down his axe, and lets the felling be undone. The heart oak stands again. The borrowed day finally moves forward; this loop ends.";
+    }
+    if (state.standoffChoice === "pact") {
+        return "The wolf and woodcutter accept a temporary truce for the wine, but the old pact remains incomplete. The day will turn again until Grandmother is free, the remedies are delivered, and the forest's terms are understood.";
+    }
     if (state.standoffChoice === "wolf") {
         return "You choose the wolf and the forest. The axe falls short of the old oath, and the woods breathe again as a living thing rather than a cut-down ruin.";
     }
@@ -472,7 +506,7 @@ const describeEnvironmentalLore = (state) => {
         "Every tree seems to listen, and every clearing keeps a secret."
     ];
     if (state.spectaclesTaken) {
-        base.push("The spectacles reveal the forest's hidden script: a lattice of old runes, family marks, and warnings written in moonlight.");
+        base.push("The spectacles reveal matching sigils on the cottage walls, closet, and oak roots: Grandmother bound this day in a forest pact.");
     }
     if (state.location === "forest_path") {
         base.push("Near the roots, a trail of pale moss and stripped bark suggests the forest has been leaving clues for someone who knows how to read them.");
@@ -484,15 +518,6 @@ const describeEnvironmentalLore = (state) => {
         base.push("The woodcutter's hunger has marked the land itself, and the forest recoils from every chopped trunk.");
     }
     return base.join("\n");
-};
-
-const revealGrandmotherMystic = (state) => {
-    if (state.grandmotherMystic) return state;
-    return {
-        ...state,
-        grandmotherMystic: true,
-        memoryFragments: Object.freeze([...state.memoryFragments, "Grandmother is not merely old; she is a hidden witch."])
-    };
 };
 
 const goToCottage = (state) => {
@@ -582,12 +607,37 @@ const handlers = {
                 ...st,
                 spectaclesTaken: true,
                 inventory: Object.freeze([...st.inventory.filter(item => item !== "spectacles"), "spectacles"]),
-                memoryFragments: Object.freeze([...st.memoryFragments, "The spectacles were enchanted and left in the wolf's snout."])
+                memoryFragments: st.memoryFragments.includes("The spectacle rims bear the same forest sigils carved into the cottage.")
+                    ? st.memoryFragments
+                    : Object.freeze([...st.memoryFragments, "The spectacle rims bear the same forest sigils carved into the cottage."])
             }));
             return {
                 state: s,
-                text: "The spectacles are impossibly warm, as though they absorb the moonlight. You slip them into your pocket, and the world seems to sharpen around you—hidden marks and strange sigils ripple across the room."
+                text: "The spectacles are impossibly warm. Fine sigils circle their rims, matching the marks carved into the closet frame. Through the lenses, the cottage walls seem to hold a second story."
             };
+        }
+        if (inCottage && target === "walls") {
+            if (!state.spectaclesTaken) {
+                return { text: "The cottage walls look bare. The spectacles on the bed may reveal what the naked eye cannot." };
+            }
+            if (state.pactRevealed) {
+                return { text: "Through the spectacles, the wall sigils resolve into the pact: Grandmother bound this day so the felling could be undone; the wolf guards the old oaks, and the woodcutter receives wine as his due if he lays down his axe." };
+            }
+            const s = applyTransition(state, st => ({
+                ...st,
+                pactRevealed: true,
+                memoryFragments: Object.freeze([...st.memoryFragments, "The wall sigils reveal Grandmother's pact: undo the felling, protect the old oaks, and give the woodcutter wine if he lays down his axe."])
+            }));
+            return {
+                state: s,
+                text: "Through the spectacles, sigils bloom across the cottage walls. Grandmother bound this day so the felling could be undone: the wolf must keep his charge over the old oaks, while the woodcutter receives wine as his due if he lays down his axe. The loop will turn until the pact is kept."
+            };
+        }
+        if (inCottage && target === "closet") {
+            if (state.grandmotherUntied) {
+                return { text: "The real Grandmother stands free. Old sigils mark her wrists and the closet frame; she is the witch who bound this day to the forest pact." };
+            }
+            return { text: `${forestEntities.closet.examine()} Something living stirs inside.` };
         }
         if (inCottage && CLUES.has(target)) {
             if (peaceful) return { text: `Grandmother smiles warmly. Her ${target} look perfectly ordinary—nothing amiss at all.` };
@@ -603,12 +653,10 @@ const handlers = {
         }
         if (inCottage && (target === "figure" || target === "grandmother")) {
             if (peaceful) return { text: "Grandmother beams at you from her bed, a little pale from her cold but perfectly herself." };
-            if (state.grandmotherUntied) return { text: "Grandmother is free, safe, and holding your hand." };
+            if (state.grandmotherUntied) return { text: "The real Grandmother is free and holding your hand; old pact sigils mark her wrists." };
             if (state.wolfSubdued) return { text: "The subdued wolf lies where the 'Grandmother' once was. The real one is in the closet!" };
-            const s = applyTransition(state, revealGrandmotherMystic);
             return {
-                state: s,
-                text: "The figure in the bed is far too large and raw-boned to be your Grandmother. Her skin is threaded with old sigils, and the cottage smells faintly of moss, iron, and rosemary. She is not merely ill—she is a hidden witch, exiled and mistrusted by the forest itself."
+                text: "The figure in the bed is the wolf in Grandmother's nightclothes, not Grandmother herself. Its disguise is plain cloth and coarse fur; no witch's sigils mark it. The real Grandmother is bound in the closet."
             };
         }
         if (forestEntities[target]) return { text: forestEntities[target].examine() };
@@ -641,7 +689,7 @@ const handlers = {
         const s = applyTransition(state, lingerInWoods);
         return {
             state: s,
-            text: `Ignoring your mother's stern advice to stay on the path, you wander into the shadowy clearings (Forest Delay: ${s.forestDelay}).`
+            text: `Ignoring your mother's stern advice to stay on the path, you wander into the shadowy clearings. Fresh-cut oak leaves a streak of white logger's chalk on your red cloak (Forest Delay: ${s.forestDelay}).`
         };
     },
 
@@ -689,10 +737,13 @@ const handlers = {
         if (target === "closet" || target === "grandmother") {
             if (state.grandmotherUntied) return { text: "Grandmother is already free." };
             if (priorOutcome === "peaceful_visit") return { text: "The closet holds nothing but Grandmother's spare linens." };
-            if (state.wolfSubdued) {
+            if (state.wolfSubdued || state.standoffChoice === "pact") {
+                const pactResolution = state.standoffChoice === "pact";
                 return {
                     state: applyTransition(state, untieGrandmotherFromCloset),
-                    text: "You and the woodcutter open the closet and carefully untie Grandmother! She embraces you tightly in profound relief. Now type 'give basket' to deliver her remedies and treats."
+                    text: pactResolution
+                        ? "The wolf steps aside when you speak the pact's terms. You open the sigil-carved closet and free the real Grandmother, an exiled witch whose wrists bear the forest's old runes. She confirms the loop began with her promise to undo the felling. Now deliver the remedies to complete the pact."
+                        : "With the wolf subdued, you open the sigil-carved closet and carefully untie Grandmother. The real Grandmother is an exiled witch, her wrists marked by the old forest pact that bound this day. Now type 'give basket' to deliver her remedies and treats."
                 };
             }
             return { text: "You cannot reach the closet while the figure in the bed watches your every move!" };
@@ -703,13 +754,37 @@ const handlers = {
     give: ({ state, target, priorOutcome }) => {
         if (state.location !== "cottage_interior") return { text: "You must be inside Grandmother's cottage to deliver the basket." };
         if (target === "wolf") return { text: "You would never hand your mother's treats to a stranger with teeth like that." };
-        if (state.inventory.length === 0) return { text: "Your basket is already empty—Grandmother has everything you brought." };
+        if (target === "woodcutter") {
+            if (priorOutcome !== "standoff" || state.standoffChoice !== null) {
+                return { text: "The woodcutter is not here to bargain. There is no point offering him wine now." };
+            }
+            if (!state.pactRevealed) {
+                return { text: "The woodcutter refuses to bargain blindly. Uncover the cottage's old terms before offering him anything." };
+            }
+            if (!state.inventory.includes("wine")) {
+                return { text: "You have no wine left to offer. The woodcutter turns away; this truce cannot be sealed." };
+            }
+            const s = applyTransition(state, st => ({
+                ...st,
+                inventory: Object.freeze(st.inventory.filter(item => item !== "wine")),
+                standoffChoice: "pact",
+                factionAffinity: "forest",
+                memoryFragments: Object.freeze([...st.memoryFragments, "The woodcutter accepts the wine and agrees to spare the heart oak."])
+            }));
+            return {
+                state: s,
+                text: "You offer the woodcutter the wine. He accepts it as his due and lays down his axe; the wolf lowers his hackles but keeps his watch. The bargain is made, but the pact will not be fulfilled until Grandmother is free and receives the remedies."
+            };
+        }
+        const remainingBasketItems = basketItems.filter(item => state.inventory.includes(item.name));
+        if (remainingBasketItems.length === 0) return { text: "Your basket is already empty—Grandmother has everything you brought." };
         if (priorOutcome === "peaceful_visit" || state.grandmotherUntied) {
             const s = applyTransition(state, st => deliverRemedies(st, basketItems));
             const perfect = s.grandmotherWellness === 100;
+            const delivered = remainingBasketItems.map(item => item.name);
             return {
                 state: s,
-                text: `You hand over the freshly baked bread, sweet wine, sweet cakes, and herbal remedies. Grandmother's spirits and health soar! Final UN SDG Goal 3 Wellness Score: ${s.grandmotherWellness}%!` +
+                text: `You hand over ${delivered.join(", ")}. Grandmother's spirits and health soar! Final UN SDG Goal 3 Wellness Score: ${s.grandmotherWellness}%!` +
                     (perfect ? "" : "\nA perfect 100% needs the clean route: stay on the path, never speak to the stranger, and arrive before the wolf does.") +
                     `\n\n${summarizeEnding(s)}`
             };
@@ -739,8 +814,8 @@ const handlers = {
             "• Sensory & Exploration: 'look around', 'listen', 'smell', 'hum tune', 'examine basket', 'examine cloak'",
             "• Forest Interactions: 'watch squirrels/rabbits/deer', 'watch roots', 'watch oak', 'talk to woodcutter', 'talk to wolf', 'wander off path'",
             "• Movement: 'walk to cottage', 'go back'",
-            "• Cottage Progression: 'lift latch', 'examine spectacles', 'wear spectacles', 'examine eyes/ears/teeth'",
-            "• Standoff Choices: 'choose wolf', 'choose woodcutter', 'protect grandmother'",
+            "• Cottage Progression: 'lift latch', 'examine spectacles', 'wear spectacles', 'examine walls', 'examine eyes/ears/teeth'",
+            "• Standoff Choices: 'choose wolf', 'choose woodcutter', 'protect grandmother', or uncover the pact and 'give woodcutter' wine",
             "• Resolution: 'open closet', 'untie grandmother', 'give basket'"
         ].join("\n")
     })
@@ -804,13 +879,19 @@ const runCommand = async (userId, command) => {
         if (chaosOutcome === "standoff") {
             narrativeResponse += "\n\n[PROLOG OUTCOME: STANDOFF]\nThe wolf has the forest at his back, but the woodcutter is already at the cottage door. You stand between predator and logger in the threshold of the old bargain. The final choice is no longer about a simple rescue—it is about who keeps the forest alive when the story turns on you.";
         } else if (chaosOutcome === "preemptive_woodcutter_rescue") {
+            const price = state.inventory.includes("wine")
+                ? "he takes the wine from your basket as payment"
+                : "with no wine left, he exacts payment in a promise to keep quiet about the oak";
             state = applyTransition(state, subdueWolfAndRescue);
-            narrativeResponse += "\n\n[PROLOG OUTCOME: PREEMPTIVE RESCUE]\nBecause you warned the woodcutter in the forest, he was already standing guard outside! The moment you question the disguised wolf, he bursts in with his trusty axe and subdues the predator! Type 'open closet' to free Grandmother.";
+            narrativeResponse += `\n\n[PROLOG OUTCOME: PREEMPTIVE RESCUE]\nThe woodcutter arrives because you warned him. He saves you, but ${price} and makes you swear not to interfere with his logging. Type 'open closet' to free Grandmother.`;
         } else if (chaosOutcome === "classic_woodcutter_rescue") {
+            const price = state.inventory.includes("wine")
+                ? "he takes the wine from your basket as payment"
+                : "with no wine left, he exacts payment in a promise to keep quiet about the oak";
             state = applyTransition(state, subdueWolfAndRescue);
-            narrativeResponse += "\n\n[PROLOG OUTCOME: HEROIC RESCUE]\nThe woodcutter's sharp ears hear the commotion from nearby! He rushes in, brandishes his trusty axe, and subdues the wolf! Type 'open closet' to untie Grandmother.";
+            narrativeResponse += `\n\n[PROLOG OUTCOME: TRANSACTIONAL RESCUE]\nThe woodcutter hears the commotion and subdues the wolf. He saves you, but ${price} and makes you swear not to interfere with his logging. Type 'open closet' to untie Grandmother.`;
         } else if (chaosOutcome === "wolf_overwhelms_red") {
-            narrativeResponse += "\n\n[PROLOG OUTCOME: AMBUSH]\nNo one is near enough to hear you. The wolf overwhelms you. GAME OVER—press 'Reset Timeline' to try again.";
+            narrativeResponse += "\n\n[PROLOG OUTCOME: AMBUSH]\nYou arrive with no answer to the forest's pact. The wolf mistakes the unanswered marks on your cloak for the logger's sign and believes you came to finish felling the heart oak. Sworn to stop anyone carrying that mark, he overwhelms you. GAME OVER—press 'Reset Timeline' to try again.";
         }
     }
 
@@ -821,7 +902,7 @@ const runCommand = async (userId, command) => {
     return { response: narrativeResponse, chaosOutcome, state, mlTelemetry };
 };
 
-const WELCOME_TEXT = "Welcome to LITTLE RED RIDING HOOD: CHAOS IN THE DEEP WOODS.\nYour mother hands you a basket of bread, sweet wine, sweet cakes, and herbal remedies for your ailing Grandmother.\n\"Stay on the path and avoid talking to strangers!\" she warns, but the words have the shape of an old omen.\nThis is not the first time the forest has swallowed this day.\nType 'help' for commands, or 'look around' to begin.";
+const WELCOME_TEXT = "Welcome to LITTLE RED RIDING HOOD: CHAOS IN THE DEEP WOODS.\nYour mother hands you a basket of bread, sweet wine, sweet cakes, and herbal remedies for your ailing Grandmother.\n\"Stay on the path and avoid talking to strangers!\" she warns, but the words have the shape of an old omen.\nThis is not the first time the forest has swallowed this day. Somewhere in the cottage, an old pact is keeping the day from moving forward.\nType 'help' for commands, or 'look around' to begin.";
 
 const resolveUserId = (raw) => {
     const userId = raw === undefined ? DEFAULT_USER : raw;
@@ -878,7 +959,7 @@ app.post('/api/reset', async (req, res) => {
         await withUserLock(userId, () => savePlayerStateToDB(userId, initialState, outcome));
         const rememberText = previousState && previousState.memoryFragments.length
             ? `You carry the memory of the previous loop: ${previousState.memoryFragments[previousState.memoryFragments.length - 1]}`
-            : "The day feels familiar, as though the forest itself is replaying a warning.";
+            : "Grandmother's old pact has bound the day in a loop: the felling must be undone, the forest protected, and the woodcutter's due fairly paid.";
         res.json({
             response: `Timeline reset. The path opens again, but it does not feel new. ${rememberText}\nMother hands you the basket of bread, sweet wine, sweet cakes, and herbal remedies: 'Stay on the path and avoid talking to strangers!' Type 'help' for commands.`,
             chaosOutcome: outcome,

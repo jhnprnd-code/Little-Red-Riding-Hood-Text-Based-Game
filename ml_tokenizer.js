@@ -27,23 +27,31 @@ const LEXICON = Object.freeze({
         open:    ['open', 'opening', 'lift', 'lifting', 'knock', 'knocking', 'unlock', 'untie', 'free', 'enter'],
         give:    ['give', 'giving', 'deliver', 'hand', 'share', 'heal', 'feed', 'offer', 'use'],
         wear:    ['wear', 'wearing', 'put', 'putting', 'don', 'donning'],
-        take:    ['take', 'taking', 'steal', 'stealing', 'grab', 'grabbing', 'lift', 'lifting'],
+        take:    ['take', 'taking', 'steal', 'stealing', 'grab', 'grabbing'],
         hum:     ['hum', 'humming', 'sing', 'singing', 'whistle', 'melody', 'tune'],
         listen:  ['listen', 'listening', 'hear', 'hearing', 'sound'],
         smell:   ['smell', 'smelling', 'sniff', 'sniffing', 'scent', 'aroma'],
+        read:    ['read', 'reading', 'decipher', 'decode', 'translate'],
+        cast:    ['cast', 'casting', 'channel'],
+        banish:  ['banish', 'banishing', 'expel', 'repel', 'dispel'],
         help:    ['help', 'command', 'commands', 'hint']
     },
     targets: {
         wolf:        ['wolf', 'stranger', 'predator', 'beast'],
         woodcutter:  ['woodcutter', 'lumberjack', 'woodsman', 'axe'],
-        basket:      ['basket', 'bread', 'wine', 'cake', 'cakes', 'remedy', 'remedies', 'treat', 'treats', 'goodies', 'inventory'],
+        basket:      ['basket', 'inventory', 'treat', 'treats', 'goodies'],
+        bread:       ['bread'],
+        wine:        ['wine'],
+        cakes:       ['cake', 'cakes'],
+        remedies:    ['remedy', 'remedies', 'medicine', 'herbs'],
         cloak:       ['cloak', 'hood', 'cape'],
         squirrels:   ['squirrel', 'squirrels'],
         rabbits:     ['rabbit', 'rabbits', 'bunny'],
         deer:        ['deer', 'fawn', 'creatures', 'animals'],
         birds:       ['bird', 'birds'],
-        trees:       ['tree', 'trees', 'oak', 'pine'],
+        trees:       ['tree', 'trees', 'pine'],
         roots:       ['root', 'roots', 'moss', 'stump', 'stumps'],
+        oak:         ['oak'],
         spectacles:  ['spectacle', 'spectacles', 'glasses', 'snout'],
         eyes:        ['eye', 'eyes'],
         ears:        ['ear', 'ears'],
@@ -51,12 +59,22 @@ const LEXICON = Object.freeze({
         figure:      ['figure', 'bed', 'disguise', 'nightgown'],
         latch:       ['latch', 'door', 'front'],
         closet:      ['closet'],
+        walls:       ['wall', 'walls', 'plaster', 'paneling'],
         grandmother: ['grandmother', 'grandma', 'granny'],
         cottage:     ['cottage', 'house', 'home'],
         back:        ['back', 'return', 'retreat', 'backward', 'backwards'],
-        path:        ['path', 'road', 'trail', 'woods', 'forest', 'around', 'room']
+        path:        ['path', 'road', 'trail', 'woods', 'forest', 'around', 'room'],
+        sigils:      ['sigil', 'sigils', 'glyph', 'glyphs', 'rune', 'runes']
     }
 });
+
+// Target categories for multi-target give pairing (item → recipient).
+const ITEM_TARGETS = Object.freeze(new Set([
+    'bread', 'wine', 'cakes', 'remedies', 'basket', 'spectacles', 'cloak'
+]));
+const CHARACTER_TARGETS = Object.freeze(new Set([
+    'wolf', 'woodcutter', 'grandmother', 'figure'
+]));
 
 const LEXICON_WORDS = Object.freeze([
     ...Object.values(LEXICON.verbs).flat(),
@@ -244,7 +262,7 @@ const encodeCommand = (text) => {
 };
 
 // ============================================================================
-// 4. LOGIC PARADIGM: Prolog Intent Resolution (order-aware)
+// 4. LOGIC PARADIGM: Prolog Intent Resolution (order-aware, multi-target)
 // ============================================================================
 const toPrologList = (ws) => `[${ws.map(w => `'${w}'`).join(",")}]`;
 
@@ -263,17 +281,33 @@ const INTENT_RULES = `
     target_at(P, T) :- word(P, X), target_words(T, L), mem(X, L).
 
     % Earliest verb in the sentence wins
-    first_verb(P) :- verb_at(P, _), \\+ (verb_at(Q, _), Q < P).
+    first_verb(P) :- verb_at(P, _), \\\\+ (verb_at(Q, _), Q < P).
 
     % Earliest target that is not the same word as the verb (before OR after it)
-    first_target(VP, T) :- target_at(P, T), P =\\= VP,
-                           \\+ (target_at(Q, _), Q =\\= VP, Q < P).
+    first_target(VP, T) :- target_at(P, T), P =\\\\= VP,
+                           \\\\+ (target_at(Q, _), Q =\\\\= VP, Q < P).
 
-    parsed_intent(V, T) :- first_verb(VP), verb_at(VP, V), !,
-                           ( first_target(VP, T) -> true ; T = around ).
-    parsed_intent(examine, T) :- first_target(0, T), !.
-    parsed_intent(unknown, none).
+    % Collect ALL targets in position order (excluding the verb position).
+    % Used for multi-target commands like "give wine to woodcutter and bread to grandmother".
+    all_targets(VP, Ts) :- findall(T, (target_at(P, T), P =\\\\= VP), Ts).
+
+    parsed_intent(V, Ts) :- first_verb(VP), verb_at(VP, V), !,
+                             all_targets(VP, Ts0),
+                             (Ts0 = [] -> Ts = [around] ; Ts = Ts0).
+    parsed_intent(examine, [T]) :- first_target(0, T), !.
+    parsed_intent(unknown, [none]).
 `;
+
+// Convert a tau-prolog list term to a JavaScript array of atom ids.
+const prologListToArray = (term) => {
+    const result = [];
+    let current = term;
+    while (current && current.id === '.' && current.args && current.args.length === 2) {
+        result.push(current.args[0].id);
+        current = current.args[1];
+    }
+    return result;
+};
 
 const resolveIntentWithProlog = (encodedWords) => {
     return new Promise((resolve, reject) => {
@@ -290,18 +324,20 @@ const resolveIntentWithProlog = (encodedWords) => {
 
         session.consult(`${INTENT_RULES}\n${lexiconFacts}\n${wordFacts}\n`, {
             success: () => {
-                session.query("parsed_intent(Verb, Target).", {
+                session.query("parsed_intent(Verb, Targets).", {
                     success: () => {
                         session.answer(answer => {
                             if (pl.type.is_error(answer)) {
                                 reject(new Error(pl.format_answer(answer)));
                             } else if (pl.type.is_substitution(answer)) {
+                                const targets = prologListToArray(answer.lookup("Targets"));
                                 resolve({
                                     verb: answer.lookup("Verb").id,
-                                    target: answer.lookup("Target").id
+                                    target: targets[0] || 'around',
+                                    targets: targets
                                 });
                             } else {
-                                resolve({ verb: "unknown", target: "none" });
+                                resolve({ verb: "unknown", target: "none", targets: ["none"] });
                             }
                         });
                     },
@@ -319,5 +355,7 @@ module.exports = {
     resolveIntentWithProlog,
     snapToLexicon,
     STOP_WORDS,
-    LEXICON
+    LEXICON,
+    ITEM_TARGETS,
+    CHARACTER_TARGETS
 };
