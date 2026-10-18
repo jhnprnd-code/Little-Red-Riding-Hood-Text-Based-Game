@@ -32,6 +32,10 @@ const LEXICON = Object.freeze({
         listen:  ['listen', 'listening', 'hear', 'hearing', 'sound'],
         smell:   ['smell', 'smelling', 'sniff', 'sniffing', 'scent', 'aroma'],
         read:    ['read', 'reading', 'decipher', 'decode', 'translate'],
+        answer:  ['answer', 'respond', 'reply'],
+        keep:    ['keep', 'keeping', 'hold', 'holding', 'preserve'],
+        end:     ['end', 'ending', 'break', 'unbind', 'release'],
+        remember:['remember', 'recall'],
         cast:    ['cast', 'casting', 'channel'],
         banish:  ['banish', 'banishing', 'expel', 'repel', 'dispel'],
         help:    ['help', 'command', 'commands', 'hint']
@@ -51,6 +55,15 @@ const LEXICON = Object.freeze({
         birds:       ['bird', 'birds'],
         trees:       ['tree', 'trees', 'pine'],
         roots:       ['root', 'roots', 'moss', 'stump', 'stumps'],
+        rosemary:    ['rosemary'],
+        raven:       ['raven', 'crow'],
+        journal:     ['journal', 'memories', 'memory'],
+        note:        ['note', 'letter'],
+        heart:       ['heart'],
+        ring:        ['ring', 'rings'],
+        count:       ['count', 'quota'],
+        bargain:     ['bargain', 'pact'],
+        mother:      ['mother'],
         oak:         ['oak'],
         spectacles:  ['spectacle', 'spectacles', 'glasses', 'snout'],
         eyes:        ['eye', 'eyes'],
@@ -281,15 +294,15 @@ const INTENT_RULES = `
     target_at(P, T) :- word(P, X), target_words(T, L), mem(X, L).
 
     % Earliest verb in the sentence wins
-    first_verb(P) :- verb_at(P, _), \\\\+ (verb_at(Q, _), Q < P).
+    first_verb(P) :- verb_at(P, _), \\+ (verb_at(Q, _), Q < P).
 
     % Earliest target that is not the same word as the verb (before OR after it)
-    first_target(VP, T) :- target_at(P, T), P =\\\\= VP,
-                           \\\\+ (target_at(Q, _), Q =\\\\= VP, Q < P).
+    first_target(VP, T) :- target_at(P, T), P =\\= VP,
+                           \\+ (target_at(Q, _), Q =\\= VP, Q < P).
 
     % Collect ALL targets in position order (excluding the verb position).
     % Used for multi-target commands like "give wine to woodcutter and bread to grandmother".
-    all_targets(VP, Ts) :- findall(T, (target_at(P, T), P =\\\\= VP), Ts).
+    all_targets(VP, Ts) :- findall(T, (target_at(P, T), P =\\= VP), Ts).
 
     parsed_intent(V, Ts) :- first_verb(VP), verb_at(VP, V), !,
                              all_targets(VP, Ts0),

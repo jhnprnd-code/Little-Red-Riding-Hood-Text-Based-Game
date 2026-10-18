@@ -106,11 +106,16 @@ export default function App() {
   };
 
   const gs = gameState;
+  const timelineClosed = Boolean(gs && (gs.gameOverTrue || gs.endingId === 'forest_collapse'));
   const chapterSummary = (() => {
     if (!gs) return null;
     const { factionAffinity, grandmotherUntied, grandmotherWellness, wolfSubdued } = gs;
+    if (gs.endingId) {
+      const ending = gs.endingCatalog?.find((item) => item.id === gs.endingId);
+      return `${gs.gameOverTrue ? 'TRUE ENDING' : 'ENDING'} — ${ending?.title || gs.endingId}: ${ending?.summary || 'The chapter has concluded.'}`;
+    }
     if (chaosOutcome === 'true_ending') {
-      return 'TRUE ENDING — Grandmother’s pact is fulfilled, the heart oak is spared, and the loop finally breaks.';
+      return 'The pact is settled, but the day will only break when Red makes the keeper’s choice.';
     }
     if (chaosOutcome === 'peaceful_visit') {
       return 'CHAPTER SUMMARY — You preserve the path, keep the bargain of the woods, and leave the cottage in a state of uneasy calm.';
@@ -146,7 +151,9 @@ export default function App() {
             onBlur={() => { if (userId !== loadedIdRef.current) loadPlayer(userId); }}
             onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur(); } }}
           />
-          <button onClick={resetTimeline} disabled={busy} style={styles.resetBtn}>Reset Timeline</button>
+          {timelineClosed
+            ? <span style={styles.closedLoop}>The day does not repeat.</span>
+            : <button onClick={resetTimeline} disabled={busy} style={styles.resetBtn}>Reset Timeline</button>}
         </div>
       </header>
 
@@ -179,12 +186,12 @@ export default function App() {
               style={styles.commandInput}
               value={input}
               maxLength={200}
-              disabled={busy}
+              disabled={busy || timelineClosed}
               onChange={(e) => setInput(e.target.value)}
               placeholder="Enter command (e.g., look around, examine basket, talk to wolf, walk to cottage)..."
               autoFocus
             />
-            <button type="submit" disabled={busy} style={styles.sendBtn}>{busy ? '...' : 'Execute'}</button>
+            <button type="submit" disabled={busy || timelineClosed} style={styles.sendBtn}>{busy ? '...' : 'Execute'}</button>
           </form>
         </div>
 
@@ -234,6 +241,8 @@ export default function App() {
             <p><strong>Hummed Tune:</strong> {gs ? String(gs.hummedTune) : 'false'}</p>
             <p><strong>Warned Woodcutter:</strong> {gs ? String(gs.warnedWoodcutter) : 'false'}</p>
             <p><strong>Grandmother Free:</strong> {gs ? String(gs.grandmotherUntied) : 'false'}</p>
+            <p><strong>Spectacles Worn:</strong> {gs ? String(gs.spectaclesWorn) : 'false'}</p>
+            <p><strong>Forest Pact Revealed:</strong> {gs ? String(gs.pactRevealed) : 'false'}</p>
           </div>
 
           <div style={styles.card}>
@@ -252,6 +261,18 @@ export default function App() {
             ) : (
               <p style={{ margin: 0, color: '#8b949e' }}>No memories yet. The woods are still waiting to reveal themselves.</p>
             )}
+          </div>
+
+          <div style={styles.card}>
+            <h3 style={styles.cardTitle}>Endings Gallery</h3>
+            <p style={{ marginTop: 0 }}>Discovered: {gs?.endingsSeen?.length || 0} / {gs?.endingCatalog?.length || 0}</p>
+            <ul style={styles.list}>
+              {(gs?.endingCatalog || []).map((ending) => (
+                <li key={ending.id} style={{ color: gs?.endingsSeen?.includes(ending.id) ? '#f2d27a' : '#8b949e' }}>
+                  {gs?.endingsSeen?.includes(ending.id) ? ending.title : '???'}
+                </li>
+              ))}
+            </ul>
           </div>
 
           <div style={styles.card}>
@@ -277,6 +298,7 @@ const styles = {
   label: { fontSize: '0.85rem' },
   userInput: { background: '#161b22', border: '1px solid #30363d', color: '#fff', padding: '6px 10px', fontFamily: 'monospace' },
   resetBtn: { background: '#8b0000', color: '#fff', border: 'none', padding: '6px 12px', cursor: 'pointer', fontFamily: 'monospace' },
+  closedLoop: { color: '#f2d27a', border: '1px solid #8b0000', padding: '6px 12px', fontFamily: 'monospace' },
   mainGrid: { display: 'grid', gridTemplateColumns: '2fr 1fr', gap: '20px', height: '78vh' },
   terminalWindow: { background: '#05080c', border: '1px solid #30363d', display: 'flex', flexDirection: 'column', justifyContent: 'space-between', padding: '16px', borderRadius: '6px' },
   logArea: { overflowY: 'auto', flexGrow: 1, paddingRight: '10px' },
