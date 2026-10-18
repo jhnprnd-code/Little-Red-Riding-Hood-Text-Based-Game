@@ -44,11 +44,14 @@ const LEXICON = Object.freeze({
         remember:['remember', 'recall'],
         cast:    ['cast', 'casting', 'channel'],
         banish:  ['banish', 'banishing', 'expel', 'repel', 'dispel'],
-        help:    ['help', 'command', 'commands', 'hint']
+        help:    ['help', 'command', 'commands', 'hint'],
+        reset:   ['reset', 'restart', 'replay']
     },
     targets: {
         wolf:        ['wolf', 'stranger', 'predator', 'beast'],
         woodcutter:  ['woodcutter', 'lumberjack', 'woodsman', 'axe'],
+        reeve:       ['reeve', 'overseer'],
+        maintenance_council: ['maintenance', 'council', 'waterboard'],
         basket:      ['basket', 'inventory', 'treat', 'treats', 'goodies'],
         bread:       ['bread'],
         wine:        ['wine'],
@@ -93,7 +96,8 @@ const LEXICON = Object.freeze({
         cottage:     ['cottage', 'house', 'home'],
         back:        ['back', 'return', 'retreat', 'backward', 'backwards'],
         path:        ['path', 'road', 'trail', 'woods', 'forest', 'around', 'room'],
-        sigils:      ['sigil', 'sigils', 'glyph', 'glyphs', 'rune', 'runes']
+        sigils:      ['sigil', 'sigils', 'glyph', 'glyphs', 'rune', 'runes'],
+        timeline:    ['timeline', 'day', 'loop']
     }
 });
 

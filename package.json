@@ -9,7 +9,8 @@
     "dev": "concurrently -k \"npm:dev:server\" \"npm:dev:client\"",
     "dev:server": "node server.js",
     "dev:client": "vite --host 0.0.0.0 --port 8080",
-    "build": "vite build"
+    "build": "vite build",
+    "package:exe": "npm run build && npx @yao-pkg/pkg server.js --targets node22-win-x64 --output dist/RedRidingHood.exe"
   },
   "dependencies": {
     "cors": "^2.8.5",
@@ -20,7 +21,20 @@
     "tau-prolog": "^0.3.4"
   },
   "devDependencies": {
+    "@yao-pkg/pkg": "^6.23.0",
     "concurrently": "^9.2.0",
     "vite": "^7.1.7"
+  },
+  "pkg": {
+    "assets": [
+      "dist/**/*",
+      "prolog_worker.js",
+      "node_modules/sqlite3/build/Release/node_sqlite3.node"
+    ],
+    "scripts": [
+      "ml_tokenizer.js",
+      "prolog_pool.js",
+      "prolog_worker.js"
+    ]
   }
 }

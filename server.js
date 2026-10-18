@@ -1,13 +1,57 @@
 const express = require('express');
 const cors = require('cors');
+const fs = require('fs');
+const Module = require('module');
+const os = require('os');
 const path = require('path');
-const sqlite3 = require('sqlite3').verbose();
+const dataDirectory = process.pkg
+    ? path.join(process.env.LOCALAPPDATA || os.homedir(), 'LittleRedRidingHood')
+    : __dirname;
+
+const loadSqlite3 = () => {
+    if (!process.pkg) return require('sqlite3').verbose();
+
+    fs.mkdirSync(dataDirectory, { recursive: true });
+    const nativeAddonPath = path.join(dataDirectory, 'node_sqlite3.node');
+    if (!fs.existsSync(nativeAddonPath)) {
+        const packagedAddonPath = path.join(
+            __dirname,
+            'node_modules',
+            'sqlite3',
+            'build',
+            'Release',
+            'node_sqlite3.node'
+        );
+        fs.copyFileSync(packagedAddonPath, nativeAddonPath);
+    }
+
+    const bindingsPath = require.resolve('bindings');
+    const bindings = require('bindings');
+    require.cache[bindingsPath].exports = name =>
+        name === 'node_sqlite3.node' ? loadNativeAddon(nativeAddonPath) : bindings(name);
+    try {
+        return require('sqlite3').verbose();
+    } finally {
+        require.cache[bindingsPath].exports = bindings;
+    }
+};
+
+const loadNativeAddon = addonPath => {
+    const nativeModule = new Module(addonPath, module);
+    nativeModule.filename = addonPath;
+    nativeModule.paths = Module._nodeModulePaths(path.dirname(addonPath));
+    nativeModule.load(addonPath);
+    return nativeModule.exports;
+};
+
+const sqlite3 = loadSqlite3();
 const { encodeCommand, resolveIntentWithProlog } = require('./ml_tokenizer');
 const { runProlog } = require('./prolog_pool');
 
 const app = express();
 app.use(cors());
 app.use(express.json());
+app.use(express.static(path.join(__dirname, 'dist')));
 
 const DEFAULT_USER = "red_player_1";
 const USER_ID_RE = /^[A-Za-z0-9_-]{1,40}$/;
@@ -50,11 +94,19 @@ const buildOutbreakState = (loopCount, previousState = null) => {
     const exposureCount = Math.min(COMMUNITY_GROUPS.length, 1 + Math.floor(loopCount / 2));
     const exposedGroups = outbreakCase.spread.slice(0, exposureCount);
     const previousWellness = previousState?.communityWellness || {};
+    const previousProtection = new Set([
+        ...(previousState?.communityProtected || []),
+        ...(previousState?.wolfContainedGroups || [])
+    ]);
+    const protectedGroups = new Set();
     const communityWellness = Object.fromEntries(COMMUNITY_GROUPS.map(group => {
         const prior = Number.isFinite(previousWellness[group]) ? previousWellness[group] : 100;
         const newlyExposed = exposedGroups.includes(group) &&
             !(previousState?.exposedGroups || []).includes(group);
-        return [group, Math.max(0, prior - (newlyExposed ? 25 : 0))];
+        const protectedFromNewExposure = newlyExposed && previousProtection.has(group);
+        if (protectedFromNewExposure) protectedGroups.add(group);
+        else if (previousProtection.has(group) && !exposedGroups.includes(group)) protectedGroups.add(group);
+        return [group, Math.max(0, prior - (newlyExposed && !protectedFromNewExposure ? 25 : 0))];
     }));
     return {
         outbreakSource: outbreakCase.source,
@@ -62,28 +114,56 @@ const buildOutbreakState = (loopCount, previousState = null) => {
         communityWellness: Object.freeze(communityWellness),
         caseEvidence: Object.freeze([]),
         caseSolved: false,
-        communityProtected: Object.freeze([]),
+        responsibilities: Object.freeze([]),
+        communityProtected: Object.freeze([...protectedGroups]),
         accusations: Object.freeze([]),
         playerCharacter: previousState?.playerCharacter || "red",
         wolfTracked: false,
         wolfContainedGroups: Object.freeze([]),
         wolfJudgment: null,
-        heartOakProtected: false
+        heartOakProtected: false,
+        wolfFindings: Object.freeze(Array.isArray(previousState?.wolfFindings) ? [...previousState.wolfFindings] : []),
+        heartOakHealth: Math.max(0, (Number.isFinite(previousState?.heartOakHealth) ? previousState.heartOakHealth : 70) - (loopCount > 0 ? 5 : 0)),
+        woodcutterDebt: Math.min(100, (Number.isFinite(previousState?.woodcutterDebt) ? previousState.woodcutterDebt : 100) + (loopCount > 0 ? 5 : 0)),
+        debtSettled: false,
+        meaningfulActionTaken: false
     };
 };
 
 const publicState = (state) => {
     const { outbreakSource, ...visibleState } = state;
+    const groupAftermath = COMMUNITY_GROUPS.map(group => {
+        const wellness = state.communityWellness[group];
+        const condition = !state.exposedGroups.includes(group) ? "unaffected"
+            : wellness >= 90 ? "recovered"
+            : wellness >= 70 ? "recovering"
+                : "still needs urgent care";
+        return {
+            group,
+            wellness,
+            condition,
+            protected: state.communityProtected.includes(group)
+        };
+    });
+    const allExposedRecovering = state.exposedGroups.every(group => state.communityWellness[group] >= 80);
     return {
         ...visibleState,
-        diagnosedSource: state.caseSolved ? outbreakSource : null
+        diagnosedSource: state.caseSolved ? outbreakSource : null,
+        outbreakAftermath: state.caseSolved ? {
+            groups: groupAftermath,
+            chapterStatus: allExposedRecovering ? "recovering" : "triage_in_progress",
+            summary: `${groupAftermath.map(({ group, condition }) => `${GROUP_LABELS[group]}: ${condition}`).join("; ")}. The diagnosis identifies a cause; recovery depends on care and protection.`,
+            allExposedRecovering
+        } : null
     };
 };
 
 // ============================================================================
 // DATABASE LAYER
 // ============================================================================
-const db = new sqlite3.Database(process.env.GAME_DB_PATH || path.join(__dirname, 'game_data.db'));
+const databasePath = process.env.GAME_DB_PATH || path.join(dataDirectory, 'game_data.db');
+fs.mkdirSync(path.dirname(databasePath), { recursive: true });
+const db = new sqlite3.Database(databasePath);
 
 const runSQL = (sql, params = []) =>
     new Promise((resolve, reject) => db.run(sql, params, (err) => (err ? reject(err) : resolve())));
@@ -230,9 +310,14 @@ const getPlayerStateFromDB = (userId) =>
                 exposedGroups: Object.freeze(Array.isArray(campaignState.exposedGroups) ? campaignState.exposedGroups : [...outbreakDefaults.exposedGroups]),
                 communityWellness: Object.freeze({ ...outbreakDefaults.communityWellness, ...(campaignState.communityWellness || {}) }),
                 caseEvidence: Object.freeze(Array.isArray(campaignState.caseEvidence) ? campaignState.caseEvidence : []),
+                responsibilities: Object.freeze(Array.isArray(campaignState.responsibilities) ? campaignState.responsibilities : []),
                 communityProtected: Object.freeze(Array.isArray(campaignState.communityProtected) ? campaignState.communityProtected : []),
                 accusations: Object.freeze(Array.isArray(campaignState.accusations) ? campaignState.accusations : []),
                 wolfContainedGroups: Object.freeze(Array.isArray(campaignState.wolfContainedGroups) ? campaignState.wolfContainedGroups : []),
+                wolfFindings: Object.freeze(Array.isArray(campaignState.wolfFindings) ? campaignState.wolfFindings : []),
+                heartOakHealth: Number.isFinite(campaignState.heartOakHealth) ? campaignState.heartOakHealth : 70,
+                woodcutterDebt: Number.isFinite(campaignState.woodcutterDebt) ? campaignState.woodcutterDebt : 100,
+                debtSettled: Boolean(campaignState.debtSettled),
                 playerCharacter: campaignState.playerCharacter === "wolf" ? "wolf" : "red"
             }));
         });
@@ -275,13 +360,19 @@ const savePlayerStateToDB = (userId, s, outcome) =>
             communityWellness: s.communityWellness,
             caseEvidence: s.caseEvidence,
             caseSolved: s.caseSolved,
+            responsibilities: s.responsibilities,
             communityProtected: s.communityProtected,
             accusations: s.accusations,
+            wolfFindings: s.wolfFindings,
             playerCharacter: s.playerCharacter,
             wolfTracked: s.wolfTracked,
             wolfContainedGroups: s.wolfContainedGroups,
             wolfJudgment: s.wolfJudgment,
-            heartOakProtected: s.heartOakProtected
+            heartOakProtected: s.heartOakProtected,
+            meaningfulActionTaken: s.meaningfulActionTaken,
+            heartOakHealth: s.heartOakHealth,
+            woodcutterDebt: s.woodcutterDebt,
+            debtSettled: s.debtSettled
         })
     ]);
 
@@ -410,12 +501,12 @@ const worldMap = {
 // ============================================================================
 // 2. FUNCTIONAL PARADIGM
 // ============================================================================
-// Wellness is a real score now. A perfect 100 needs the clean route:
-//   start 35 + 65 (full basket) = 100.
+// Wellness is a real score now. The basket adds up to 65 wellness points;
+// magical remedies and spectacles can add further bonuses on the pact route.
 // Penalties at delivery: -5 per turn dawdling (max -30), -10 for speaking to the
 // wolf, -15 if Grandmother had to be rescued from the closet (she gets +10 for
 // being freed first). Wolf routes therefore land around 85, dawdling lowers it more.
-const WELLNESS_START = 35;
+const WELLNESS_START = 15;
 const clamp = (n, lo, hi) => Math.max(lo, Math.min(hi, n));
 
 const ENDING_REGISTRY = Object.freeze({
@@ -455,8 +546,15 @@ const addMemoryKey = (state, key, fragment) => {
 
 const createInitialState = (previousState = null) => {
     const loopCount = previousState ? previousState.loopCount + 1 : 0;
+    const wolfMemoryFragments = (previousState?.playerCharacter === "wolf" ? previousState.wolfFindings || [] : [])
+        .map(finding => `The wolf's last watch left a memory: ${finding}`);
+    const memoryFragments = [...new Set([
+        ...(previousState ? previousState.memoryFragments : []),
+        ...wolfMemoryFragments
+    ])];
     return Object.freeze({
     location: "forest_path",
+    meaningfulActionTaken: false,
     stayedOnPath: true,
     talkedToWolf: false,
     revealedDestination: false,
@@ -472,7 +570,7 @@ const createInitialState = (previousState = null) => {
     inventory: Object.freeze([...basketItems.map(item => item.name), "rosemary"]),
     factionAffinity: "neutral",
     loopCount,
-    memoryFragments: Object.freeze(previousState ? [...previousState.memoryFragments] : []),
+    memoryFragments: Object.freeze(memoryFragments),
     memoryKeys: Object.freeze([...new Set([...(previousState ? previousState.memoryKeys : []), "rosemary"])]),
     endingsSeen: Object.freeze(previousState ? [...previousState.endingsSeen] : []),
     rosemaryHeld: true,
@@ -610,9 +708,10 @@ const CHAOS_RULES = `
     unrescued_ambush  :- wolf_infiltrated, clues_noticed(N), N >= 3,
                          \\+ woodcutter_alerted, faction_affinity(neutral),
                          \\+ mark_disguised(true).
-    safe_reunion      :- \\+ wolf_infiltrated.
+    safe_reunion      :- location(cottage_interior), \\+ wolf_infiltrated.
 
     story_outcome(true_ending)                 :- game_over_true(true), !.
+    story_outcome(uncertain)                   :- location(Location), Location \\= cottage_interior, !.
     story_outcome(pact_fulfilled)              :- fulfilled_pact, !.
     story_outcome(grandmother_saved_and_untied) :- grandmother_untied(true), !.
     story_outcome(standoff)                     :- standoff_at_cottage, !.
@@ -631,16 +730,20 @@ const OUTBREAK_RULES = `
     diagnosis(shared_water) :- evidence(brook_water), evidence(sick_well).
     case_accurate :- diagnosis(Source), outbreak_source(Source).
 
-    accusation_allowed(woodcutter) :- case_accurate, outbreak_source(runoff).
-    accusation_allowed(forest_pact) :- case_accurate, outbreak_source(oak_blight).
-    accusation_allowed(water_supply) :- case_accurate, outbreak_source(shared_water).
+    responsibility(reeve, quota_pressure) :- case_accurate, outbreak_source(runoff), evidence(quota_marks).
+    responsibility(maintenance_council, water_neglect) :- case_accurate, outbreak_source(shared_water), evidence(sick_well), evidence(brook_water).
+    responsibility(no_person, ecological_event) :- case_accurate, outbreak_source(oak_blight), evidence(oak_rings), evidence(spore_drift).
+
+    accusation_allowed(reeve) :- responsibility(reeve, quota_pressure).
+    accusation_allowed(maintenance_council) :- responsibility(maintenance_council, water_neglect).
 
     urgent_group(Group) :- exposed(Group), community_wellness(Group, Score), Score < 80.
 
-    outbreak_result(Sources, Suspects, Groups) :-
+    outbreak_result(Sources, Suspects, Groups, Responsibilities) :-
         findall(Source, diagnosis(Source), Sources),
         findall(Suspect, accusation_allowed(Suspect), Suspects),
-        findall(Group, urgent_group(Group), Groups).
+        findall(Group, urgent_group(Group), Groups),
+        findall(Actor-Reason, responsibility(Actor, Reason), Responsibilities).
 `;
 
 const evaluateOutbreak = async (state) => {
@@ -653,15 +756,19 @@ const evaluateOutbreak = async (state) => {
     const program = `${facts}\n${OUTBREAK_RULES}`;
     const result = await runProlog(
         program,
-        "outbreak_result(Sources, Suspects, Groups).",
-        ["Sources", "Suspects", "Groups"]
+        "outbreak_result(Sources, Suspects, Groups, Responsibilities).",
+        ["Sources", "Suspects", "Groups", "Responsibilities"]
     );
     const inferredSources = result?.Sources || [];
     return {
         inferredSources,
         diagnosedSource: inferredSources.includes(state.outbreakSource) ? state.outbreakSource : null,
         supportedAccusations: result?.Suspects || [],
-        urgentGroups: result?.Groups || []
+        urgentGroups: result?.Groups || [],
+        responsibilities: (result?.Responsibilities || []).map(({ functor, args }) => ({
+            actor: args[0],
+            reason: args[1]
+        }))
     };
 };
 
@@ -669,6 +776,7 @@ const evaluateChaosRules = (state) => {
     if (state.gameOverTrue) return Promise.resolve("true_ending");
     if (state.endingId === "forest_collapse") return Promise.resolve("forest_collapse");
     const facts = `
+        location(${state.location}).
             stayed_on_path(${state.stayedOnPath}).
             talked_to_wolf(${state.talkedToWolf}).
             revealed_destination(${state.revealedDestination}).
@@ -817,7 +925,7 @@ const handleStandoffChoice = (state, choice) => {
 
 const GIVE_ITEMS = new Set([...basketItems.map(item => item.name), "basket"]);
 GIVE_ITEMS.add("rosemary");
-const GIVE_RECIPIENTS = new Set(["grandmother", "woodcutter", "wolf", ...COMMUNITY_GROUPS]);
+const GIVE_RECIPIENTS = new Set(["grandmother", "woodcutter", "wolf", "oak", ...COMMUNITY_GROUPS]);
 const expandGiveItem = (item) => item === "basket"
     ? basketItems.map(basketItem => basketItem.name)
     : [item];
@@ -852,7 +960,7 @@ const CASE_CLUE_TEXT = Object.freeze({
     hamlet: ["sick_well", "The hamlet's well shares a mineral taste and residue with the brook."]
 });
 const CASE_SOURCE_TEXT = Object.freeze({
-    runoff: "The case points to contaminated runoff from the logging clearings entering the brook. The woodcutter's quota explains pressure and opportunity, but the evidence does not show that he intended the illness.",
+    runoff: "The case points to contaminated runoff from the logging clearings entering the brook. The Reeve's quota created the pressure that drove the cutting; the evidence does not show the woodcutter intentionally caused the illness.",
     oak_blight: "The case points to a blight carried by the heart oak's spores. The wolf's guarding may have delayed discovery, but the forest is not choosing to infect anyone.",
     shared_water: "The case points to a shared water source linking the hamlet and logging camp. No single person caused it; neglected maintenance let exposure spread."
 });
@@ -866,12 +974,19 @@ const addCaseEvidence = (state, key, fragment) => {
     return addMemoryKey(withEvidence, `evidence_${key}`, fragment);
 };
 
+const addWolfFinding = (state, finding) => state.wolfFindings.includes(finding)
+    ? state.wolfFindings
+    : Object.freeze([...state.wolfFindings, finding]);
+
 const recordCommunityCare = (state, group, requestedItems) => {
-    let wellness = state.communityWellness[group];
+    const initialWellness = state.communityWellness[group];
+    let wellness = initialWellness;
     let inventory = [...state.inventory];
     const protectedGroups = new Set(state.communityProtected);
     const used = [];
     const refused = [];
+    let fullWellness = wellness >= 100;
+    let alreadyProtected = protectedGroups.has(group);
     const carePoints = { bread: 8, cakes: 8, remedies: 25 };
     for (const item of requestedItems) {
         if (item === "wine") {
@@ -883,12 +998,22 @@ const recordCommunityCare = (state, group, requestedItems) => {
             continue;
         }
         if (item === "rosemary") {
+            if (protectedGroups.has(group)) {
+                alreadyProtected = true;
+                refused.push(item);
+                continue;
+            }
             inventory = inventory.filter(held => held !== item);
             protectedGroups.add(group);
             used.push(item);
             continue;
         }
         if (!carePoints[item]) {
+            refused.push(item);
+            continue;
+        }
+        if (wellness >= 100) {
+            fullWellness = true;
             refused.push(item);
             continue;
         }
@@ -905,7 +1030,11 @@ const recordCommunityCare = (state, group, requestedItems) => {
             communityProtected: Object.freeze([...protectedGroups])
         },
         used,
-        refused
+        refused,
+        initialWellness,
+        finalWellness: wellness,
+        fullWellness,
+        alreadyProtected
     };
 };
 
@@ -1011,7 +1140,21 @@ const handlers = {
             const fragments = state.memoryFragments.length
                 ? state.memoryFragments.map(fragment => `• ${fragment}`).join("\n")
                 : "No written fragments yet. The day still feels new.";
-            return { text: `JOURNAL — Loop ${state.loopCount}\nKnown keys: ${keys}\n${fragments}` };
+            const cluePairs = [
+                ["quota marks", "brook water"],
+                ["oak rings", "spore drift"],
+                ["brook water", "sick well"]
+            ];
+            const evidence = new Set(state.caseEvidence.map(key => key.replace(/_/g, " ")));
+            const incompletePairs = cluePairs
+                .filter(pair => !pair.every(clue => evidence.has(clue)))
+                .map(pair => pair.map(clue => evidence.has(clue) ? `[${clue}]` : clue).join(" + "));
+            const guidance = state.caseSolved
+                ? "The source is identified. Treat exposed groups with food or remedies, or use rosemary to protect one from worsening in the next turning."
+                : incompletePairs.length === 0
+                    ? "All clue pairs are complete. Type 'diagnose outbreak' to ask Prolog to compare the evidence with this loop's case."
+                : `Investigation hint: collect both clues in one evidence pair (${incompletePairs.join("; ")}). The journal gives no verdict until the evidence supports one.`;
+            return { text: `JOURNAL — Loop ${state.loopCount}\nKnown keys: ${keys}\n${guidance}\n${fragments}` };
         }
         if (CASE_CLUE_TEXT[target]) {
             const [key, clue] = CASE_CLUE_TEXT[target];
@@ -1158,11 +1301,14 @@ const handlers = {
         if (!keeperChoiceReady(state)) return { text: keeperChoiceRequirementText(state) };
         const s = applyTransition(state, st => recordEnding({
             ...st,
-            grandmotherWellness: 100
+            grandmotherWellness: 100,
+            heartOakHealth: 100,
+            woodcutterDebt: 0,
+            debtSettled: true
         }, "warden", true));
         return {
             state: s,
-            text: "You keep the count: the heart oak, the wolf's charge, the logger's due, and Grandmother's promise. You choose to tend the pact rather than inherit its punishment. The remedies remain in your basket; the loop breaks, and the woods begin to heal.\n\nTRUE ENDING — THE WARDEN."
+            text: "You keep the count: the heart oak, the wolf's charge, the logger's due, and Grandmother's promise. You choose to tend the pact rather than inherit its punishment. The remedies restore the heart oak, and the Reeve's debt is forgiven in exchange for the woodcutter's stewardship. The loop breaks; the woods begin to heal.\n\nTRUE ENDING — THE WARDEN."
         };
     },
 
@@ -1174,7 +1320,8 @@ const handlers = {
         const s = applyTransition(state, st => recordEnding({
             ...st,
             inventory: Object.freeze(st.inventory.filter(item => item !== "remedies")),
-            grandmotherWellness: clamp(st.grandmotherWellness + 10, 0, 100)
+            grandmotherWellness: clamp(st.grandmotherWellness + 10, 0, 100),
+            heartOakHealth: clamp(st.heartOakHealth + 10, 0, 100)
         }, "unbinding", true));
         return {
             state: s,
@@ -1201,27 +1348,24 @@ const handlers = {
         }
         const s = applyTransition(state, st => addMemoryKey({
             ...st,
-            caseSolved: true
+            caseSolved: true,
+            responsibilities: Object.freeze(inference.responsibilities)
         }, "diagnosed_outbreak", CASE_SOURCE_TEXT[inference.diagnosedSource]));
         const urgent = inference.urgentGroups.length
             ? ` Urgent care is needed in ${inference.urgentGroups.map(group => GROUP_LABELS[group]).join(", ")}.`
             : "";
         return {
             state: s,
-            text: `${CASE_SOURCE_TEXT[inference.diagnosedSource]}${urgent} Evidence permits a supported accusation, but care can begin before the case is closed.`
+            text: `${CASE_SOURCE_TEXT[inference.diagnosedSource]}${urgent} Diagnosis is not recovery: the exposed communities still need treatment and protection. ${inference.responsibilities.length
+                ? `The evidence points to responsibility at ${inference.responsibilities.map(item => `${item.actor.replace(/_/g, " ")} (${item.reason.replace(/_/g, " ")})`).join(", ")}.`
+                : "The evidence identifies an ecological cause, not a person to blame."} Care can begin before any accusation.`
         };
     },
 
     accuse: async ({ state, target }) => {
         if (state.playerCharacter !== "red") return { text: "The wolf does not prosecute suspects. Track the sick groups and decide whether to protect Red or keep away." };
-        const suspect = target === "woodcutter"
-            ? "woodcutter"
-            : target === "bargain" || target === "forest"
-                ? "forest_pact"
-                : target === "water_supply"
-                    ? "water_supply"
-                    : null;
-        if (!suspect) return { text: "Accuse only from evidence: 'accuse woodcutter', 'accuse pact', or 'accuse well'." };
+        const suspect = target === "reeve" || target === "maintenance_council" ? target : null;
+        if (!suspect) return { text: "Use 'accuse reeve' or 'accuse maintenance council' only when the evidence supports systemic responsibility. The outbreak's source is not proof of an individual's intent." };
         const inference = await evaluateOutbreak(state);
         if (!inference.supportedAccusations.includes(suspect)) {
             const stateHint = inference.inferredSources.length
@@ -1232,19 +1376,22 @@ const handlers = {
         const s = applyTransition(state, st => ({
             ...st,
             caseSolved: true,
-            accusations: Object.freeze([...st.accusations, suspect])
+            accusations: Object.freeze([...st.accusations, suspect]),
+            responsibilities: Object.freeze(inference.responsibilities)
         }));
         return {
             state: s,
-            text: `${CASE_SOURCE_TEXT[inference.diagnosedSource]} Your accusation is supported as a cause, not a verdict of personal guilt. The response is prevention and care, not punishment.`
+            text: `${CASE_SOURCE_TEXT[inference.diagnosedSource]} The evidence supports a finding of ${inference.responsibilities.find(item => item.actor === suspect)?.reason.replace(/_/g, " ") || "systemic responsibility"}, not a verdict of personal guilt. The response is prevention and care, not punishment.`
         };
     },
 
     track: ({ state, target }) => {
         if (state.playerCharacter !== "wolf") return { text: "Tracking the sick trail is the wolf's perspective; Red can investigate evidence and diagnose the case." };
+        const observation = `The wolf traced the outbreak across ${state.exposedGroups.map(group => `${GROUP_LABELS[group]} (${state.communityWellness[group]}% wellness)`).join(", ")}.`;
         const s = applyTransition(state, st => addMemoryKey({
             ...st,
-            wolfTracked: true
+            wolfTracked: true,
+            wolfFindings: addWolfFinding(st, observation)
         }, "wolf_tracked_outbreak", "The wolf followed symptoms through the forest and learned which communities were exposed."));
         const affected = state.exposedGroups.map(group =>
             `${GROUP_LABELS[group]} (${state.communityWellness[group]}% wellness)`).join(", ");
@@ -1258,14 +1405,22 @@ const handlers = {
         if (state.playerCharacter !== "wolf") return { text: "Containment is the wolf's role. Red can provide care with 'give remedies to hamlet/woodland/camp'." };
         if (!state.wolfTracked) return { text: "Track the outbreak first; you will not quarantine a community on scent alone." };
         if (!COMMUNITY_GROUPS.includes(target)) return { text: "Choose a group to protect: hamlet, woodland, or logging camp." };
+        if (!state.exposedGroups.includes(target)) {
+            return { text: `${GROUP_LABELS[target]} shows no outbreak exposure this loop; there is nothing to contain there.` };
+        }
+        if (state.wolfContainedGroups.includes(target)) {
+            return { text: `${GROUP_LABELS[target]} is already contained. Focus on the other exposed groups.` };
+        }
         const contained = new Set(state.wolfContainedGroups);
         const protectedGroups = new Set(state.communityProtected);
         contained.add(target);
         protectedGroups.add(target);
+        const finding = `The wolf contained ${GROUP_LABELS[target]} before its health could decline further.`;
         const nextState = {
             ...state,
             wolfContainedGroups: Object.freeze([...contained]),
-            communityProtected: Object.freeze([...protectedGroups])
+            communityProtected: Object.freeze([...protectedGroups]),
+            wolfFindings: addWolfFinding(state, finding)
         };
         const allExposuresContained = state.exposedGroups.every(group => contained.has(group));
         const finished = allExposuresContained && state.heartOakProtected;
@@ -1299,7 +1454,9 @@ const handlers = {
         if (target !== "oak" && target !== "heart") return { text: "Guard the heart oak, or guard Red's trail from the logger." };
         const s = applyTransition(state, st => ({
             ...st,
-            heartOakProtected: true
+            heartOakProtected: true,
+            heartOakHealth: clamp(st.heartOakHealth + (st.heartOakProtected ? 0 : 10), 0, 100),
+            wolfFindings: addWolfFinding(st, `The wolf guarded the heart oak; its health was ${st.heartOakHealth}% before the vigil.`)
         }));
         const complete = s.exposedGroups.every(group => s.wolfContainedGroups.includes(group));
         const finalState = complete
@@ -1407,8 +1564,8 @@ const handlers = {
 
     give: ({ state, target, priorOutcome, itemsToGive }) => {
         if (state.playerCharacter !== "red" ||
-            (state.location !== "cottage_interior" && !COMMUNITY_GROUPS.includes(target))) {
-            return { text: "Red can treat the community along the forest path or deliver the basket at Grandmother's cottage." };
+            (state.location !== "cottage_interior" && target !== "oak" && !COMMUNITY_GROUPS.includes(target))) {
+            return { text: "Red can treat the communities or repair the heart oak along the forest path, then deliver the remaining basket at Grandmother's cottage." };
         }
         const requestedItems = itemsToGive || (target === "basket"
             ? basketItems.map(item => item.name)
@@ -1421,6 +1578,10 @@ const handlers = {
                 return {
                     text: result.refused.includes("wine")
                         ? "Wine can support a negotiation, but it is not treatment. Keep it for the woodcutter's due; use bread, cakes, remedies, or rosemary for community care."
+                        : result.fullWellness && result.finalWellness >= 100
+                            ? `${GROUP_LABELS[target]} is already at full wellness (100%); no supplies are used.`
+                            : result.alreadyProtected && result.refused.includes("rosemary")
+                                ? `${GROUP_LABELS[target]} is already protected by rosemary; no supplies are used.`
                         : `You have no usable supplies for ${GROUP_LABELS[target]}.`
                 };
             }
@@ -1432,9 +1593,27 @@ const handlers = {
             const refused = result.refused.length
                 ? ` Not used: ${result.refused.join(", ")}.`
                 : "";
+            const wellnessChange = result.finalWellness > result.initialWellness
+                ? ` Community wellness improves from ${result.initialWellness}% to ${result.finalWellness}%.`
+                : ` Community wellness remains at ${result.finalWellness}%.`;
             return {
                 state: s,
-                text: `You provide ${result.used.join(", ")} to ${GROUP_LABELS[target]}. Community wellness rises to ${s.communityWellness[target]}%.${prevention}${urgent}${refused}`
+                text: `You provide ${result.used.join(", ")} to ${GROUP_LABELS[target]}.${wellnessChange}${prevention}${urgent}${refused}`
+            };
+        }
+        if (target === "oak") {
+            if (!requestedItems.includes("remedies") || !state.inventory.includes("remedies")) {
+                return { text: "The heart oak's roots can be treated with the remedies. Keep them until you choose to repair the damage." };
+            }
+            const previousHealth = state.heartOakHealth;
+            const s = applyTransition(state, st => ({
+                ...st,
+                inventory: Object.freeze(st.inventory.filter(item => item !== "remedies")),
+                heartOakHealth: clamp(st.heartOakHealth + 30, 0, 100)
+            }));
+            return {
+                state: s,
+                text: `You work the remedies into the heart oak's damaged roots. Its measurable health rises from ${previousHealth}% to ${s.heartOakHealth}%. The basket can no longer be used to unbind the pact.`
             };
         }
         if (target === "woodcutter") {
@@ -1453,13 +1632,15 @@ const handlers = {
             const s = applyTransition(state, st => ({
                 ...st,
                 inventory: Object.freeze(st.inventory.filter(item => item !== "wine")),
+                woodcutterDebt: Math.max(0, st.woodcutterDebt - 30),
+                debtSettled: st.woodcutterDebt <= 30,
                 standoffChoice: "pact",
                 factionAffinity: "forest",
-                memoryFragments: Object.freeze([...st.memoryFragments, "The woodcutter accepts the wine and agrees to spare the heart oak."])
+                memoryFragments: Object.freeze([...st.memoryFragments, "The woodcutter accepts the wine as partial payment, reducing his recorded debt by 30; he agrees to spare the heart oak."])
             }));
             return {
                 state: s,
-                text: "You offer the woodcutter the wine. He accepts it as his due and lays down his axe; the wolf lowers his hackles but keeps his watch. The bargain is made, but the pact will not be fulfilled until Grandmother is free and receives the remedies."
+                text: `You offer the woodcutter the wine. He accepts it as partial payment; his recorded debt falls to ${s.woodcutterDebt} units. He lays down his axe, while the wolf keeps his watch. The pact is made, but it will not be fulfilled until Grandmother is free and receives the remedies.`
             };
         }
         const requested = requestedItems.length > 0 ? requestedItems : basketItems.map(item => item.name);
@@ -1522,14 +1703,51 @@ const handlers = {
     help: () => ({
         text: [
             "Available Commands:",
-            "• Red—investigate: 'examine stump/brook/roots/oak/hamlet', 'watch birds', 'diagnose outbreak', 'accuse woodcutter/pact/well'",
-            "• Red—triage: 'give remedies to hamlet', 'give bread to woodland', 'give rosemary to camp'; multi-pair giving is supported",
+            "• Red—investigate: 'examine stump/brook/roots/oak/hamlet', 'watch birds', 'diagnose outbreak', 'accuse reeve/maintenance council'",
+            "• Red—triage: 'give remedies to hamlet', 'give bread to woodland', 'give rosemary to camp', or 'give remedies to oak'; multi-pair giving is supported",
             "• Red—story: 'talk to wolf/woodcutter/raven', 'walk to cottage', 'examine eyes/ears/teeth', 'wear spectacles', 'answer the heart oak remembers every ring'",
             "• Wolf—unlocked after a Red run: 'track outbreak', 'contain hamlet/woodland/camp', 'guard heart oak', 'approach red'",
             "• Lore and replay: 'examine journal', 'read basket', 'wander off path', 'reset timeline'",
             "• Red pact choices: 'give wine to woodcutter', then 'keep the count' (Warden) or 'end the bargain' (Unbinding)"
         ].join("\n")
     })
+};
+
+const resetTimelineState = async (previousState) => {
+    if (previousState && !previousState.meaningfulActionTaken) {
+        return {
+            response: "The day has not advanced, so resetting will not begin another loop. Take a meaningful action first.",
+            chaosOutcome: await evaluateChaosRules(previousState),
+            state: previousState
+        };
+    }
+
+    const initialState = previousState
+        ? createInitialState(previousState)
+        : createInitialState();
+    const outcome = await evaluateChaosRules(initialState);
+    const rememberText = initialState.endingId === "forest_collapse"
+        ? "The outer ward gives way. The heart oak is falling in every remembered version of the day; there is no next loop."
+        : previousState && previousState.memoryFragments.length
+            ? `You carry the memory of the previous loop: ${previousState.memoryFragments[previousState.memoryFragments.length - 1]}`
+            : "Grandmother's old pact has bound the day in a loop: the felling must be undone, the forest protected, and the woodcutter's due fairly paid.";
+    const motherText = initialState.endingId === "forest_collapse"
+        ? "Mother's warning is swallowed by the breaking woods."
+        : initialState.loopCount >= 2
+            ? "Mother hands you the basket. Her warning now carries an echo: 'Read what I tucked beneath the rosemary. Don't spend the remedies before you know what they can do.'"
+            : initialState.loopCount === 1
+                ? "Mother hands you the basket again. 'You look as though you have heard this before. Stay on the path, Red.'"
+                : "Mother hands you the basket: 'Stay on the path and avoid talking to strangers!'";
+
+    return {
+        response: initialState.endingId === "forest_collapse"
+            ? `Timeline reset. ${rememberText}`
+            : initialState.playerCharacter === "wolf"
+                ? `The day turns again from the forest's edge. ${rememberText} The wolf smells a new trail of illness and must decide which groups to contain.`
+                : `Timeline reset. The path opens again, but it does not feel new. ${rememberText}\n${motherText} Type 'help' for commands.`,
+        chaosOutcome: outcome,
+        state: initialState
+    };
 };
 
 const runCommand = async (userId, command) => {
@@ -1559,6 +1777,17 @@ const runCommand = async (userId, command) => {
             : "UNRESOLVED"
     };
 
+    if (resolved && verb === "reset") {
+        const reset = await resetTimelineState(state);
+        await savePlayerStateToDB(userId, reset.state, reset.chaosOutcome);
+        return {
+            response: reset.response,
+            chaosOutcome: reset.chaosOutcome,
+            state: publicState(reset.state),
+            mlTelemetry
+        };
+    }
+
     if (state.playerCharacter === "wolf") {
         if (state.endingId === "wolf_sentinel") {
             return {
@@ -1574,7 +1803,7 @@ const runCommand = async (userId, command) => {
         const result = handler
             ? await handler({ state, target, command })
             : { text: "As the wolf, use 'track outbreak', 'contain hamlet/woodland/camp', 'guard heart oak', or 'approach red'. Type 'help' for commands." };
-        if (result.state) state = result.state;
+        if (result.state) state = { ...result.state, meaningfulActionTaken: true };
         await savePlayerStateToDB(userId, state, state.endingId || "wolf_campaign");
         return {
             response: result.text,
@@ -1601,7 +1830,7 @@ const runCommand = async (userId, command) => {
         const result = handleStandoffChoice(state, standoffChoice);
         const chaosOutcome = "standoff";
         narrativeResponse = result.text + `\n\n[CHOICE: ${standoffChoice.toUpperCase()}]`;
-        state = result.state;
+        state = { ...result.state, meaningfulActionTaken: true };
         await savePlayerStateToDB(userId, state, chaosOutcome);
         runSQL(`INSERT INTO chaos_logs (user_id, command, resulting_outcome) VALUES (?, ?, ?)`,
             [userId, command, chaosOutcome]).catch(err => console.error("chaos_logs insert failed:", err.message));
@@ -1619,13 +1848,13 @@ const runCommand = async (userId, command) => {
                     priorOutcome,
                     itemsToGive: group.items
                 });
-                if (result.state) state = result.state;
+                if (result.state) state = { ...result.state, meaningfulActionTaken: true };
                 responses.push(result.text);
             }
             narrativeResponse = responses.join("\n");
         } else {
             const result = handlers.give({ state, target, priorOutcome, command });
-            if (result.state) state = result.state;
+            if (result.state) state = { ...result.state, meaningfulActionTaken: true };
             narrativeResponse = result.text;
         }
     } else {
@@ -1636,7 +1865,7 @@ const runCommand = async (userId, command) => {
         if (resolved && handler) {
             const result = await handler({ state, target, priorOutcome, command });
             narrativeResponse = result.text;
-            if (result.state) state = result.state;
+            if (result.state) state = { ...result.state, meaningfulActionTaken: true };
         }
     }
 
@@ -1778,33 +2007,20 @@ app.post('/api/reset', async (req, res) => {
     if (!userId) return badUser(res);
     try {
         await dbReady;
-        const previousState = await withUserLock(userId, () => getPlayerStateFromDB(userId));
-        if (previousState && (previousState.gameOverTrue || previousState.endingId === "forest_collapse")) {
-            return res.status(409).json({ error: "The loop is closed. This ending is final; the day does not repeat." });
-        }
-        const initialState = createInitialState(previousState || createInitialState());
-        const outcome = await evaluateChaosRules(initialState);
-        await withUserLock(userId, () => savePlayerStateToDB(userId, initialState, outcome));
-        const rememberText = initialState.endingId === "forest_collapse"
-            ? "The outer ward gives way. The heart oak is falling in every remembered version of the day; there is no next loop."
-            : previousState && previousState.memoryFragments.length
-                ? `You carry the memory of the previous loop: ${previousState.memoryFragments[previousState.memoryFragments.length - 1]}`
-                : "Grandmother's old pact has bound the day in a loop: the felling must be undone, the forest protected, and the woodcutter's due fairly paid.";
-        const motherText = initialState.endingId === "forest_collapse"
-            ? "Mother's warning is swallowed by the breaking woods."
-            : initialState.loopCount >= 2
-                ? "Mother hands you the basket. Her warning now carries an echo: 'Read what I tucked beneath the rosemary. Don't spend the remedies before you know what they can do.'"
-                : initialState.loopCount === 1
-                    ? "Mother hands you the basket again. 'You look as though you have heard this before. Stay on the path, Red.'"
-                    : "Mother hands you the basket: 'Stay on the path and avoid talking to strangers!'";
+        const result = await withUserLock(userId, async () => {
+            const previousState = await getPlayerStateFromDB(userId);
+            if (previousState && (previousState.gameOverTrue || previousState.endingId === "forest_collapse")) {
+                return { status: 409, error: "The loop is closed. This ending is final; the day does not repeat." };
+            }
+            const reset = await resetTimelineState(previousState);
+            await savePlayerStateToDB(userId, reset.state, reset.chaosOutcome);
+            return { status: 200, ...reset };
+        });
+        if (result.status !== 200) return res.status(result.status).json({ error: result.error });
         res.json({
-            response: initialState.endingId === "forest_collapse"
-                ? `Timeline reset. ${rememberText}`
-                : initialState.playerCharacter === "wolf"
-                    ? `The day turns again from the forest's edge. ${rememberText} The wolf smells a new trail of illness and must decide which groups to contain.`
-                    : `Timeline reset. The path opens again, but it does not feel new. ${rememberText}\n${motherText} Type 'help' for commands.`,
-            chaosOutcome: outcome,
-            state: publicState(initialState)
+            response: result.response,
+            chaosOutcome: result.chaosOutcome,
+            state: publicState(result.state)
         });
     } catch (error) {
         console.error(error);
@@ -1812,5 +2028,10 @@ app.post('/api/reset', async (req, res) => {
     }
 });
 
+app.get('*', (req, res, next) => {
+    if (req.path.startsWith('/api/')) return next();
+    res.sendFile(path.join(__dirname, 'dist', 'index.html'));
+});
+
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Multi-Paradigm Zork Server running on http://localhost:${PORT}`));
+app.listen(PORT, () => console.log(`Little Red Riding Hood is running at http://localhost:${PORT}`));

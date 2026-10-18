@@ -6,7 +6,7 @@ const API =
   (typeof window !== 'undefined' && window.__API__) ||
   `${window.location.protocol}//${window.location.hostname}:3000`;
 
-const INITIAL_WELLNESS = 20;
+const INITIAL_WELLNESS = 15;
 const EMPTY_TELEMETRY = { subwords: [], tokenIds: [], corrections: [], resolvedIntent: 'AWAITING INPUT' };
 
 const post = async (path, body) => {
@@ -25,7 +25,7 @@ export default function App() {
   const [input, setInput] = useState('');
   const [logs, setLogs] = useState([{ sender: 'SYSTEM', text: 'Loading your timeline...' }]);
   const [gameState, setGameState] = useState(null);
-  const [chaosOutcome, setChaosOutcome] = useState('peaceful_visit');
+  const [chaosOutcome, setChaosOutcome] = useState('uncertain');
   const [mlTelemetry, setMlTelemetry] = useState(EMPTY_TELEMETRY);
   // One request at a time: stops double-submits and out-of-order responses.
   const [busy, setBusy] = useState(false);
@@ -134,7 +134,7 @@ export default function App() {
         : `WOLF ROUTE — Track the outbreak, contain the exposed groups, and guard the heart oak. Red remains a risk to judge, not an automatic ally.`;
     }
     if (gs.caseSolved) {
-      return `CASE SOLVED — ${gs.diagnosedSource?.replace(/_/g, ' ') || 'outbreak source identified'}. Red can now accuse from evidence or prioritize care for the groups with the lowest wellness.`;
+      return `${gs.outbreakAftermath?.chapterStatus === 'recovering' ? 'AFTERMATH — ' : 'TRIAGE — '}${gs.outbreakAftermath?.summary || `The case identifies ${gs.diagnosedSource?.replace(/_/g, ' ') || 'the outbreak source'}, but recovery still depends on care.`}`;
     }
     if (gs.endingId) {
       const ending = gs.endingCatalog?.find((item) => item.id === gs.endingId);
@@ -279,6 +279,17 @@ export default function App() {
           </div>
 
           <div style={styles.card}>
+            <h3 style={styles.cardTitle}>Forest Pact Legacy</h3>
+            <p style={styles.metricLabel}>Heart oak health: {gs?.heartOakHealth ?? 70}%</p>
+            <div style={styles.progressBarBg}>
+              <div style={{ ...styles.progressBarFill, width: `${gs?.heartOakHealth ?? 70}%`, background: (gs?.heartOakHealth ?? 70) < 50 ? '#d29922' : '#2ea043' }} />
+            </div>
+            <p style={{ ...styles.metricLabel, marginTop: '10px' }}>
+              Woodcutter's Reeve debt: {gs?.debtSettled ? 'settled through stewardship' : `${gs?.woodcutterDebt ?? 100} units outstanding`}
+            </p>
+          </div>
+
+          <div style={styles.card}>
             <h3 style={styles.cardTitle}>Community Wellness & Exposure</h3>
             {(gs?.exposedGroups || []).map((group) => (
               <p key={group} style={{ margin: '0 0 6px 0', color: '#ffb86b' }}>
@@ -304,8 +315,23 @@ export default function App() {
               <h3 style={styles.cardTitle}>Outbreak Case File</h3>
               <p><strong>Evidence:</strong> {gs?.caseEvidence?.length ? gs.caseEvidence.map((clue) => clue.replace(/_/g, ' ')).join(', ') : 'none gathered yet'}</p>
               <p><strong>Diagnosis:</strong> {gs?.diagnosedSource?.replace(/_/g, ' ') || 'not established'}</p>
-              <p><strong>Accusations supported:</strong> {gs?.accusations?.length ? gs.accusations.map((item) => item.replace(/_/g, ' ')).join(', ') : 'none'}</p>
-              <p style={{ marginBottom: 0 }}>Use evidence before accusing. Care can begin before diagnosis; remedies treat, while rosemary protects against further exposure.</p>
+              <p><strong>Accountability found:</strong> {gs?.responsibilities?.length ? gs.responsibilities.map((item) => `${item.actor.replace(/_/g, ' ')} (${item.reason.replace(/_/g, ' ')})`).join('; ') : gs?.caseSolved ? 'ecological cause; no individual blame supported' : 'not established'}</p>
+              <p><strong>Recorded accusations:</strong> {gs?.accusations?.length ? gs.accusations.map((item) => item.replace(/_/g, ' ')).join(', ') : 'none'}</p>
+              <p style={{ marginBottom: 0 }}>Diagnosis identifies the cause, not automatic guilt or recovery. Use evidence before accusing; remedies treat illness, while rosemary prevents further decline.</p>
+            </div>
+          )}
+
+          {gs?.outbreakAftermath && (
+            <div style={styles.card}>
+              <h3 style={styles.cardTitle}>Outbreak Aftermath</h3>
+              <p>{gs.outbreakAftermath.chapterStatus === 'recovering'
+                ? 'The first wave of care is taking hold. Recovery remains uneven.'
+                : 'The diagnosis is only the beginning; some communities still need urgent care.'}</p>
+              {gs.outbreakAftermath.groups.map(({ group, wellness, condition }) => (
+                <p key={group} style={{ margin: '0 0 6px 0' }}>
+                  <strong>{group.replace('_', ' ')}:</strong> {condition} ({wellness}%)
+                </p>
+              ))}
             </div>
           )}
 
