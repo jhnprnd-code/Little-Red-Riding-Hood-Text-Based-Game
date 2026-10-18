@@ -6,7 +6,7 @@ const API =
   (typeof window !== 'undefined' && window.__API__) ||
   `${window.location.protocol}//${window.location.hostname}:3000`;
 
-const INITIAL_WELLNESS = 35;
+const INITIAL_WELLNESS = 20;
 const EMPTY_TELEMETRY = { subwords: [], tokenIds: [], corrections: [], resolvedIntent: 'AWAITING INPUT' };
 
 const post = async (path, body) => {
