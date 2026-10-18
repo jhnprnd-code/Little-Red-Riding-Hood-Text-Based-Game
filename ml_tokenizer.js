@@ -33,6 +33,12 @@ const LEXICON = Object.freeze({
         smell:   ['smell', 'smelling', 'sniff', 'sniffing', 'scent', 'aroma'],
         read:    ['read', 'reading', 'decipher', 'decode', 'translate'],
         answer:  ['answer', 'respond', 'reply'],
+        accuse:  ['accuse', 'accusing', 'blame', 'charge'],
+        diagnose:['diagnose', 'diagnosing', 'identify', 'trace'],
+        track:   ['track', 'tracking', 'trail', 'trace'],
+        contain: ['contain', 'containing', 'quarantine', 'isolate', 'block'],
+        guard:   ['guard', 'guarding', 'defend', 'defending', 'protect', 'protecting'],
+        approach:['approach', 'approaching', 'meet'],
         keep:    ['keep', 'keeping', 'hold', 'holding', 'preserve'],
         end:     ['end', 'ending', 'break', 'unbind', 'release'],
         remember:['remember', 'recall'],
@@ -54,7 +60,17 @@ const LEXICON = Object.freeze({
         deer:        ['deer', 'fawn', 'creatures', 'animals'],
         birds:       ['bird', 'birds'],
         trees:       ['tree', 'trees', 'pine'],
-        roots:       ['root', 'roots', 'moss', 'stump', 'stumps'],
+        roots:       ['root', 'roots', 'moss'],
+        stump:       ['stump', 'stumps'],
+        brook:       ['brook', 'stream', 'creek', 'water'],
+        hamlet:      ['hamlet', 'village', 'villagers'],
+        woodland:    ['woodland', 'wildlife', 'forestfolk'],
+        logging_camp:['camp', 'loggingcamp', 'loggercamp', 'loggers'],
+        outbreak:    ['outbreak', 'illness', 'sickness', 'disease'],
+        red:         ['red', 'girl', 'rider'],
+        forest:      ['forestfolk', 'heartoak'],
+        water_supply:['watersupply', 'well'],
+        spores:      ['spore', 'spores', 'blight'],
         rosemary:    ['rosemary'],
         raven:       ['raven', 'crow'],
         journal:     ['journal', 'memories', 'memory'],
@@ -83,10 +99,10 @@ const LEXICON = Object.freeze({
 
 // Target categories for multi-target give pairing (item → recipient).
 const ITEM_TARGETS = Object.freeze(new Set([
-    'bread', 'wine', 'cakes', 'remedies', 'basket', 'spectacles', 'cloak'
+    'bread', 'wine', 'cakes', 'remedies', 'rosemary', 'basket', 'spectacles', 'cloak'
 ]));
 const CHARACTER_TARGETS = Object.freeze(new Set([
-    'wolf', 'woodcutter', 'grandmother', 'figure'
+    'wolf', 'woodcutter', 'grandmother', 'figure', 'hamlet', 'woodland', 'logging_camp'
 ]));
 
 const LEXICON_WORDS = Object.freeze([

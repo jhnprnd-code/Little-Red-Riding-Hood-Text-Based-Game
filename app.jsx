@@ -105,11 +105,37 @@ export default function App() {
     }
   };
 
+  const changeCharacter = async () => {
+    if (busy || !gameState) return;
+    const character = gameState.playerCharacter === 'wolf' ? 'red' : 'wolf';
+    setBusy(true);
+    try {
+      const data = await post('/api/character', { userId, character });
+      setLogs([{ sender: 'SYSTEM', text: data.response }]);
+      applyServerState(data);
+      setMlTelemetry(EMPTY_TELEMETRY);
+    } catch (err) {
+      setLogs((prev) => [...prev, { sender: 'ERROR', text: `Character change failed: ${err.message}` }]);
+    } finally {
+      setBusy(false);
+      inputRef.current?.focus();
+    }
+  };
+
   const gs = gameState;
   const timelineClosed = Boolean(gs && (gs.gameOverTrue || gs.endingId === 'forest_collapse'));
+  const wolfUnlocked = Boolean(gs && (gs.endingsSeen?.length > 0 || gs.loopCount > 0));
   const chapterSummary = (() => {
     if (!gs) return null;
     const { factionAffinity, grandmotherUntied, grandmotherWellness, wolfSubdued } = gs;
+    if (gs.playerCharacter === 'wolf') {
+      return gs.endingId === 'wolf_sentinel'
+        ? 'WOLF ROUTE — The exposed groups are contained and the heart oak is guarded. The wolf keeps his distance from Red.'
+        : `WOLF ROUTE — Track the outbreak, contain the exposed groups, and guard the heart oak. Red remains a risk to judge, not an automatic ally.`;
+    }
+    if (gs.caseSolved) {
+      return `CASE SOLVED — ${gs.diagnosedSource?.replace(/_/g, ' ') || 'outbreak source identified'}. Red can now accuse from evidence or prioritize care for the groups with the lowest wellness.`;
+    }
     if (gs.endingId) {
       const ending = gs.endingCatalog?.find((item) => item.id === gs.endingId);
       return `${gs.gameOverTrue ? 'TRUE ENDING' : 'ENDING'} — ${ending?.title || gs.endingId}: ${ending?.summary || 'The chapter has concluded.'}`;
@@ -136,7 +162,7 @@ export default function App() {
     <div style={styles.container}>
       <header style={styles.header}>
         <div>
-          <h1 style={styles.title}>RED RIDING HOOD: A Text-Based Adventure Game</h1>
+          <h1 style={styles.title}>{gs?.playerCharacter === 'wolf' ? 'THE WOLF: A Forest Guardian Story' : 'RED RIDING HOOD: A Text-Based Adventure Game'}</h1>
           <span style={styles.subtitle}>CS121 Multi-Paradigm System </span>
         </div>
         <div style={styles.accountBox}>
@@ -151,6 +177,11 @@ export default function App() {
             onBlur={() => { if (userId !== loadedIdRef.current) loadPlayer(userId); }}
             onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); e.currentTarget.blur(); } }}
           />
+          {gs?.playerCharacter === 'wolf' && !timelineClosed
+            ? <button onClick={changeCharacter} disabled={busy} style={styles.resetBtn}>Start New Red Loop</button>
+            : wolfUnlocked && !timelineClosed
+              ? <button onClick={changeCharacter} disabled={busy} style={styles.resetBtn}>Play as Wolf</button>
+              : null}
           {timelineClosed
             ? <span style={styles.closedLoop}>The day does not repeat.</span>
             : <button onClick={resetTimeline} disabled={busy} style={styles.resetBtn}>Reset Timeline</button>}
@@ -230,6 +261,8 @@ export default function App() {
 
           <div style={styles.card}>
             <h3 style={styles.cardTitle}>Prolog Chaos Engine</h3>
+            <p><strong>Playable Character:</strong> {gs ? (gs.playerCharacter === 'wolf' ? 'Wolf' : 'Red') : 'Red'}</p>
+            <p><strong>Outbreak Cycle:</strong> {gs ? gs.loopCount % 3 + 1 : 1} / 3</p>
             <p><strong>Active Timeline:</strong> <span style={styles.badge}>{chaosOutcome}</span></p>
             <p><strong>Location:</strong> {gs ? gs.location : 'forest_path'}</p>
             <p><strong>Faction:</strong> {gs ? (gs.factionAffinity || 'neutral') : 'neutral'}</p>
@@ -244,6 +277,37 @@ export default function App() {
             <p><strong>Spectacles Worn:</strong> {gs ? String(gs.spectaclesWorn) : 'false'}</p>
             <p><strong>Forest Pact Revealed:</strong> {gs ? String(gs.pactRevealed) : 'false'}</p>
           </div>
+
+          <div style={styles.card}>
+            <h3 style={styles.cardTitle}>Community Wellness & Exposure</h3>
+            {(gs?.exposedGroups || []).map((group) => (
+              <p key={group} style={{ margin: '0 0 6px 0', color: '#ffb86b' }}>
+                <strong>Exposed:</strong> {group.replace('_', ' ')}
+              </p>
+            ))}
+            {Object.entries(gs?.communityWellness || {}).map(([group, score]) => (
+              <div key={group} style={{ marginBottom: '10px' }}>
+                <p style={styles.metricLabel}>
+                  {group.replace('_', ' ')}{gs?.communityProtected?.includes(group) ? ' · protected' : ''}
+                  {gs?.playerCharacter === 'wolf' && gs?.wolfContainedGroups?.includes(group) ? ' · contained' : ''}
+                </p>
+                <div style={styles.progressBarBg}>
+                  <div style={{ ...styles.progressBarFill, width: `${score}%`, background: score < 80 ? '#d29922' : '#2ea043' }} />
+                </div>
+                <p style={styles.metricValue}>{score} / 100 wellness</p>
+              </div>
+            ))}
+          </div>
+
+          {gs?.playerCharacter !== 'wolf' && (
+            <div style={styles.card}>
+              <h3 style={styles.cardTitle}>Outbreak Case File</h3>
+              <p><strong>Evidence:</strong> {gs?.caseEvidence?.length ? gs.caseEvidence.map((clue) => clue.replace(/_/g, ' ')).join(', ') : 'none gathered yet'}</p>
+              <p><strong>Diagnosis:</strong> {gs?.diagnosedSource?.replace(/_/g, ' ') || 'not established'}</p>
+              <p><strong>Accusations supported:</strong> {gs?.accusations?.length ? gs.accusations.map((item) => item.replace(/_/g, ' ')).join(', ') : 'none'}</p>
+              <p style={{ marginBottom: 0 }}>Use evidence before accusing. Care can begin before diagnosis; remedies treat, while rosemary protects against further exposure.</p>
+            </div>
+          )}
 
           <div style={styles.card}>
             <h3 style={styles.cardTitle}>Chapter Summary</h3>

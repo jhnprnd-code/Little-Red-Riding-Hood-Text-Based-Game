@@ -23,6 +23,63 @@ const safeJsonParse = (raw, fallback = []) => {
     }
 };
 
+const safeJsonObject = (raw, fallback = {}) => {
+    if (raw === null || raw === undefined || raw === "") return fallback;
+    try {
+        const parsed = JSON.parse(raw);
+        return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : fallback;
+    } catch {
+        return fallback;
+    }
+};
+
+const COMMUNITY_GROUPS = Object.freeze(["hamlet", "woodland", "logging_camp"]);
+const GROUP_LABELS = Object.freeze({
+    hamlet: "the hamlet",
+    woodland: "the woodland animals",
+    logging_camp: "the logging camp"
+});
+const OUTBREAK_CASES = Object.freeze([
+    { source: "runoff", spread: Object.freeze(["logging_camp", "hamlet", "woodland"]) },
+    { source: "oak_blight", spread: Object.freeze(["woodland", "hamlet", "logging_camp"]) },
+    { source: "shared_water", spread: Object.freeze(["hamlet", "logging_camp", "woodland"]) }
+]);
+
+const buildOutbreakState = (loopCount, previousState = null) => {
+    const outbreakCase = OUTBREAK_CASES[loopCount % OUTBREAK_CASES.length];
+    const exposureCount = Math.min(COMMUNITY_GROUPS.length, 1 + Math.floor(loopCount / 2));
+    const exposedGroups = outbreakCase.spread.slice(0, exposureCount);
+    const previousWellness = previousState?.communityWellness || {};
+    const communityWellness = Object.fromEntries(COMMUNITY_GROUPS.map(group => {
+        const prior = Number.isFinite(previousWellness[group]) ? previousWellness[group] : 100;
+        const newlyExposed = exposedGroups.includes(group) &&
+            !(previousState?.exposedGroups || []).includes(group);
+        return [group, Math.max(0, prior - (newlyExposed ? 25 : 0))];
+    }));
+    return {
+        outbreakSource: outbreakCase.source,
+        exposedGroups: Object.freeze(exposedGroups),
+        communityWellness: Object.freeze(communityWellness),
+        caseEvidence: Object.freeze([]),
+        caseSolved: false,
+        communityProtected: Object.freeze([]),
+        accusations: Object.freeze([]),
+        playerCharacter: previousState?.playerCharacter || "red",
+        wolfTracked: false,
+        wolfContainedGroups: Object.freeze([]),
+        wolfJudgment: null,
+        heartOakProtected: false
+    };
+};
+
+const publicState = (state) => {
+    const { outbreakSource, ...visibleState } = state;
+    return {
+        ...visibleState,
+        diagnosedSource: state.caseSolved ? outbreakSource : null
+    };
+};
+
 // ============================================================================
 // DATABASE LAYER
 // ============================================================================
@@ -75,6 +132,7 @@ const dbReady = new Promise((resolve, reject) => {
                 game_over_true INTEGER DEFAULT 0,
                 rescue_type TEXT DEFAULT NULL,
                 mark_disguised INTEGER DEFAULT 0,
+                campaign_state TEXT DEFAULT '{}',
                 spectacles_taken INTEGER DEFAULT 0,
                 spectacles_worn INTEGER DEFAULT 0,
                 grandmother_mystic INTEGER DEFAULT 0,
@@ -97,6 +155,7 @@ const dbReady = new Promise((resolve, reject) => {
                 await ensureColumn('player_sessions_v3', 'game_over_true', 'INTEGER DEFAULT 0');
                 await ensureColumn('player_sessions_v3', 'rescue_type', 'TEXT DEFAULT NULL');
                 await ensureColumn('player_sessions_v3', 'mark_disguised', 'INTEGER DEFAULT 0');
+                await ensureColumn('player_sessions_v3', 'campaign_state', "TEXT DEFAULT '{}'");
                 await ensureColumn('player_sessions_v3', 'spectacles_taken', 'INTEGER DEFAULT 0');
                 await ensureColumn('player_sessions_v3', 'spectacles_worn', 'INTEGER DEFAULT 0');
                 await ensureColumn('player_sessions_v3', 'grandmother_mystic', 'INTEGER DEFAULT 0');
@@ -124,6 +183,9 @@ const getPlayerStateFromDB = (userId) =>
         db.get(`SELECT * FROM player_sessions_v3 WHERE user_id = ?`, [userId], (err, row) => {
             if (err) return reject(err);
             if (!row) return resolve(null);
+            const campaignState = safeJsonObject(row.campaign_state);
+            const loopCount = Number(row.loop_count || 0);
+            const outbreakDefaults = buildOutbreakState(loopCount, campaignState);
             resolve(Object.freeze({
                 location: row.location,
                 stayedOnPath: Boolean(row.stayed_on_path),
@@ -141,7 +203,7 @@ const getPlayerStateFromDB = (userId) =>
                 inventory: Object.freeze(safeJsonParse(row.inventory, basketItems.map(item => item.name))),
                 chaosOutcome: row.chaos_outcome,
                 factionAffinity: row.faction_affinity || "neutral",
-                loopCount: Number(row.loop_count || 0),
+                loopCount,
                 memoryFragments: Object.freeze(safeJsonParse(row.memory_fragments, [])),
                 memoryKeys: Object.freeze([...new Set([
                     ...safeJsonParse(row.memory_keys, []),
@@ -161,7 +223,17 @@ const getPlayerStateFromDB = (userId) =>
                 grandmotherMystic: Boolean(row.grandmother_mystic),
                 standoffChoice: row.standoff_choice || null,
                 pactRevealed: Boolean(row.pact_revealed),
-                deliveryPenaltyApplied: Boolean(row.delivery_penalty_applied)
+                deliveryPenaltyApplied: Boolean(row.delivery_penalty_applied),
+                ...outbreakDefaults,
+                ...campaignState,
+                outbreakSource: campaignState.outbreakSource || outbreakDefaults.outbreakSource,
+                exposedGroups: Object.freeze(Array.isArray(campaignState.exposedGroups) ? campaignState.exposedGroups : [...outbreakDefaults.exposedGroups]),
+                communityWellness: Object.freeze({ ...outbreakDefaults.communityWellness, ...(campaignState.communityWellness || {}) }),
+                caseEvidence: Object.freeze(Array.isArray(campaignState.caseEvidence) ? campaignState.caseEvidence : []),
+                communityProtected: Object.freeze(Array.isArray(campaignState.communityProtected) ? campaignState.communityProtected : []),
+                accusations: Object.freeze(Array.isArray(campaignState.accusations) ? campaignState.accusations : []),
+                wolfContainedGroups: Object.freeze(Array.isArray(campaignState.wolfContainedGroups) ? campaignState.wolfContainedGroups : []),
+                playerCharacter: campaignState.playerCharacter === "wolf" ? "wolf" : "red"
             }));
         });
     });
@@ -176,11 +248,11 @@ const savePlayerStateToDB = (userId, s, outcome) =>
             memory_keys, endings_seen, rosemary_held, ritual_ready, ritual_answered,
             ending_id, game_over_true, rescue_type, mark_disguised,
             spectacles_taken, spectacles_worn, grandmother_mystic, standoff_choice, pact_revealed,
-            delivery_penalty_applied
+            delivery_penalty_applied, campaign_state
         ) VALUES (
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
             ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
-            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
         )
     `, [
         userId, s.location,
@@ -196,7 +268,21 @@ const savePlayerStateToDB = (userId, s, outcome) =>
         s.spectaclesTaken ? 1 : 0,
         s.spectaclesWorn ? 1 : 0,
         s.grandmotherMystic ? 1 : 0, s.standoffChoice || null, s.pactRevealed ? 1 : 0,
-        s.deliveryPenaltyApplied ? 1 : 0
+        s.deliveryPenaltyApplied ? 1 : 0,
+        JSON.stringify({
+            outbreakSource: s.outbreakSource,
+            exposedGroups: s.exposedGroups,
+            communityWellness: s.communityWellness,
+            caseEvidence: s.caseEvidence,
+            caseSolved: s.caseSolved,
+            communityProtected: s.communityProtected,
+            accusations: s.accusations,
+            playerCharacter: s.playerCharacter,
+            wolfTracked: s.wolfTracked,
+            wolfContainedGroups: s.wolfContainedGroups,
+            wolfJudgment: s.wolfJudgment,
+            heartOakProtected: s.heartOakProtected
+        })
     ]);
 
 // Serialize requests per player so read-modify-write cycles never interleave
@@ -275,6 +361,7 @@ const forestEntities = {
     roots: new ForestDetail("roots", "The roots of the ancient oaks are exposed like knotted fingers. Rosemary grows in a protected hollow; beneath it, faint moon-silver writing circles the heart oak.", false),
     stump: new ForestDetail("stump", "A freshly cut oak stump still dripping sap. Quota marks on its pale face tally the Reeve's demand: the woodcutter is paid by the trunk, and the forest is paying the difference.", false),
     oak: new ForestDetail("oak", "The central oak is older than the village. It carries the silence of a guardian who has seen too many winters.", false),
+    brook: new ForestDetail("brook", "A narrow brook runs from the logging clearings past the hamlet. A rainbow sheen clings to one stone.", false),
     moss: new GameEntity("moss", "A patch of moss glows faintly under the roots, as if the forest is trying to leave a trail for you."),
     spectacles: new GameEntity("spectacles", "Grandmother's spectacles, resting awkwardly on a suspiciously large snout. Tiny sigils are etched around the rims."),
     closet: new GameEntity("closet", "A sturdy wooden closet in the corner of the cottage, its frame carved with the same old sigils."),
@@ -341,7 +428,8 @@ const ENDING_REGISTRY = Object.freeze({
     logger_mark: { title: "The Mark on the Cloak", summary: "The wolf mistakes Red for the logger's agent and carries out his oath to stop her." },
     forest_collapse: { title: "The Forest Unravels", summary: "Six repetitions have weakened the ward beyond repair." },
     warden: { title: "The Warden", summary: "Red keeps the count, protects the heart oak, and accepts the work of tending the pact." },
-    unbinding: { title: "The Unbinding", summary: "Red ends the bargain, spending the remedies to release the day from its old promise." }
+    unbinding: { title: "The Unbinding", summary: "Red ends the bargain, spending the remedies to release the day from its old promise." },
+    wolf_sentinel: { title: "The Sentinel's Vigil", summary: "The wolf contains the outbreak's spread and keeps the heart oak under watch without trusting Red." }
 });
 const ENDING_CATALOG = Object.freeze(Object.entries(ENDING_REGISTRY).map(([id, ending]) => Object.freeze({ id, ...ending })));
 
@@ -365,7 +453,9 @@ const addMemoryKey = (state, key, fragment) => {
     return { ...next, memoryFragments: Object.freeze([...next.memoryFragments, fragment]) };
 };
 
-const createInitialState = (previousState = null) => Object.freeze({
+const createInitialState = (previousState = null) => {
+    const loopCount = previousState ? previousState.loopCount + 1 : 0;
+    return Object.freeze({
     location: "forest_path",
     stayedOnPath: true,
     talkedToWolf: false,
@@ -379,9 +469,9 @@ const createInitialState = (previousState = null) => Object.freeze({
     wolfSubdued: false,
     grandmotherUntied: false,
     grandmotherWellness: WELLNESS_START,
-    inventory: Object.freeze(basketItems.map(item => item.name)),
+    inventory: Object.freeze([...basketItems.map(item => item.name), "rosemary"]),
     factionAffinity: "neutral",
-    loopCount: previousState ? previousState.loopCount + 1 : 0,
+    loopCount,
     memoryFragments: Object.freeze(previousState ? [...previousState.memoryFragments] : []),
     memoryKeys: Object.freeze([...new Set([...(previousState ? previousState.memoryKeys : []), "rosemary"])]),
     endingsSeen: Object.freeze(previousState ? [...previousState.endingsSeen] : []),
@@ -399,6 +489,7 @@ const createInitialState = (previousState = null) => Object.freeze({
     standoffChoice: null,
     pactRevealed: false,
     deliveryPenaltyApplied: false,
+    ...buildOutbreakState(loopCount, previousState),
     ...(previousState && previousState.loopCount >= 5
         ? recordEnding({
             endingsSeen: previousState.endingsSeen,
@@ -406,7 +497,8 @@ const createInitialState = (previousState = null) => Object.freeze({
             gameOverTrue: false
         }, "forest_collapse", false)
         : {})
-});
+    });
+};
 
 const applyTransition = (currentState, updaterFn) => Object.freeze(updaterFn({ ...currentState }));
 
@@ -531,6 +623,62 @@ const CHAOS_RULES = `
     story_outcome(peaceful_visit)               :- safe_reunion, !.
     story_outcome(uncertain).
 `;
+
+const OUTBREAK_RULES = `
+    evidence(_) :- fail.
+    diagnosis(runoff) :- evidence(quota_marks), evidence(brook_water).
+    diagnosis(oak_blight) :- evidence(oak_rings), evidence(spore_drift).
+    diagnosis(shared_water) :- evidence(brook_water), evidence(sick_well).
+    case_accurate :- diagnosis(Source), outbreak_source(Source).
+
+    accusation_allowed(woodcutter) :- case_accurate, outbreak_source(runoff).
+    accusation_allowed(forest_pact) :- case_accurate, outbreak_source(oak_blight).
+    accusation_allowed(water_supply) :- case_accurate, outbreak_source(shared_water).
+
+    urgent_group(Group) :- exposed(Group), community_wellness(Group, Score), Score < 80.
+`;
+
+const prologHasSolution = (program, query) => new Promise((resolve, reject) => {
+    const session = pl.create();
+    session.consult(program, {
+        success: () => session.query(query, {
+            success: () => session.answer(answer => {
+                if (pl.type.is_error(answer)) reject(new Error(pl.format_answer(answer)));
+                else resolve(pl.type.is_substitution(answer));
+            }),
+            error: reject
+        }),
+        error: reject
+    });
+});
+
+const evaluateOutbreak = async (state) => {
+    const facts = [
+        `outbreak_source(${state.outbreakSource}).`,
+        ...state.caseEvidence.map(evidence => `evidence(${evidence}).`),
+        ...state.exposedGroups.map(group => `exposed(${group}).`),
+        ...COMMUNITY_GROUPS.map(group => `community_wellness(${group},${state.communityWellness[group]}).`)
+    ].join("\n");
+    const program = `${facts}\n${OUTBREAK_RULES}`;
+    const inferredSources = [];
+    for (const source of OUTBREAK_CASES.map(item => item.source)) {
+        if (await prologHasSolution(program, `diagnosis(${source}).`)) inferredSources.push(source);
+    }
+    const supportedAccusations = [];
+    for (const suspect of ["woodcutter", "forest_pact", "water_supply"]) {
+        if (await prologHasSolution(program, `accusation_allowed(${suspect}).`)) supportedAccusations.push(suspect);
+    }
+    const urgentGroups = [];
+    for (const group of COMMUNITY_GROUPS) {
+        if (await prologHasSolution(program, `urgent_group(${group}).`)) urgentGroups.push(group);
+    }
+    return {
+        inferredSources,
+        diagnosedSource: inferredSources.includes(state.outbreakSource) ? state.outbreakSource : null,
+        supportedAccusations,
+        urgentGroups
+    };
+};
 
 const evaluateChaosRules = (state) => {
     if (state.gameOverTrue) return Promise.resolve("true_ending");
@@ -699,7 +847,8 @@ const handleStandoffChoice = (state, choice) => {
 };
 
 const GIVE_ITEMS = new Set([...basketItems.map(item => item.name), "basket"]);
-const GIVE_RECIPIENTS = new Set(["grandmother", "woodcutter", "wolf"]);
+GIVE_ITEMS.add("rosemary");
+const GIVE_RECIPIENTS = new Set(["grandmother", "woodcutter", "wolf", ...COMMUNITY_GROUPS]);
 const expandGiveItem = (item) => item === "basket"
     ? basketItems.map(basketItem => basketItem.name)
     : [item];
@@ -723,6 +872,72 @@ const pairGiveTargets = (targets) => {
         else groups.push({ recipient: "grandmother", items: [...pendingItems] });
     }
     return groups;
+};
+
+const CASE_CLUE_TEXT = Object.freeze({
+    stump: ["quota_marks", "The stump's tally marks match the Reeve's quota; the cut is recent, but the ledger does not prove intent."],
+    brook: ["brook_water", "A rainbow sheen in the brook runs downstream from the logging clearings."],
+    roots: ["oak_rings", "The heart oak's exposed rings bear a pale pattern repeated in the sick leaves."],
+    oak: ["oak_rings", "The heart oak's exposed rings bear a pale pattern repeated in the sick leaves."],
+    birds: ["spore_drift", "The birds' droppings carry fine pale spores from the oldest boughs."],
+    hamlet: ["sick_well", "The hamlet's well shares a mineral taste and residue with the brook."]
+});
+const CASE_SOURCE_TEXT = Object.freeze({
+    runoff: "The case points to contaminated runoff from the logging clearings entering the brook. The woodcutter's quota explains pressure and opportunity, but the evidence does not show that he intended the illness.",
+    oak_blight: "The case points to a blight carried by the heart oak's spores. The wolf's guarding may have delayed discovery, but the forest is not choosing to infect anyone.",
+    shared_water: "The case points to a shared water source linking the hamlet and logging camp. No single person caused it; neglected maintenance let exposure spread."
+});
+
+const addCaseEvidence = (state, key, fragment) => {
+    if (state.caseEvidence.includes(key)) return state;
+    const withEvidence = {
+        ...state,
+        caseEvidence: Object.freeze([...state.caseEvidence, key])
+    };
+    return addMemoryKey(withEvidence, `evidence_${key}`, fragment);
+};
+
+const recordCommunityCare = (state, group, requestedItems) => {
+    let wellness = state.communityWellness[group];
+    let inventory = [...state.inventory];
+    const protectedGroups = new Set(state.communityProtected);
+    const used = [];
+    const refused = [];
+    const carePoints = { bread: 8, cakes: 8, remedies: 25 };
+    for (const item of requestedItems) {
+        if (item === "wine") {
+            refused.push(item);
+            continue;
+        }
+        if (!inventory.includes(item)) {
+            refused.push(item);
+            continue;
+        }
+        if (item === "rosemary") {
+            inventory = inventory.filter(held => held !== item);
+            protectedGroups.add(group);
+            used.push(item);
+            continue;
+        }
+        if (!carePoints[item]) {
+            refused.push(item);
+            continue;
+        }
+        inventory = inventory.filter(held => held !== item);
+        wellness = clamp(wellness + carePoints[item], 0, 100);
+        used.push(item);
+    }
+    return {
+        state: {
+            ...state,
+            inventory: Object.freeze(inventory),
+                rosemaryHeld: used.includes("rosemary") ? false : state.rosemaryHeld,
+                communityWellness: Object.freeze({ ...state.communityWellness, [group]: wellness }),
+            communityProtected: Object.freeze([...protectedGroups])
+        },
+        used,
+        refused
+    };
 };
 
 const KEEPER_KEYS = Object.freeze(["rosemary", "mother_note", "eyes", "ears", "teeth", "ritual_answer", "pact"]);
@@ -764,13 +979,18 @@ const handlers = {
     watch: ({ state, target }) => {
         if (state.location !== "forest_path") return { text: "There are no forest creatures here." };
         const entity = forestEntities[target];
+        if (target === "brook" || target === "birds") {
+            const [key, clue] = CASE_CLUE_TEXT[target === "brook" ? "brook" : "birds"];
+            const s = applyTransition(state, st => addCaseEvidence(st, key, clue));
+            return { state: s, text: `${entity.examine()}\n${clue}` };
+        }
         if (target === "roots") {
-            const s = applyTransition(state, st => addMemoryKey(
-                st,
-                "quota",
-                "Under the oak roots, tally marks show the woodcutter's Reeve-imposed quota. His debt is real; so is the ruin it demands."
+            const s = applyTransition(state, st => addCaseEvidence(
+                addMemoryKey(st, "quota", "Under the oak roots, tally marks show the woodcutter's Reeve-imposed quota. His debt is real; so is the ruin it demands."),
+                "oak_rings",
+                CASE_CLUE_TEXT.roots[1]
             ));
-            return { state: s, text: `${entity.examine()}\nYou find quota marks beneath the roots. The clue explains the logger's debt without excusing the trees already lost.` };
+            return { state: s, text: `${entity.examine()}\n${CASE_CLUE_TEXT.roots[1]}` };
         }
         if (target === "raven") {
             const remembered = state.loopCount > 0
@@ -823,6 +1043,11 @@ const handlers = {
                 ? state.memoryFragments.map(fragment => `• ${fragment}`).join("\n")
                 : "No written fragments yet. The day still feels new.";
             return { text: `JOURNAL — Loop ${state.loopCount}\nKnown keys: ${keys}\n${fragments}` };
+        }
+        if (CASE_CLUE_TEXT[target]) {
+            const [key, clue] = CASE_CLUE_TEXT[target];
+            const s = applyTransition(state, st => addCaseEvidence(st, key, clue));
+            return { state: s, text: `${clue}\nCase evidence recorded: ${key.replace(/_/g, " ")}.` };
         }
         if (inCottage && target === "spectacles") {
             return {
@@ -910,6 +1135,18 @@ const handlers = {
                 text: `${state.loopCount ? '"You again. The Reeve still wants the same number of trunks."' : npcs.woodcutter.speak()}\nHe will watch the cottage, but warns that the Reeve's quota follows him even here.`
             };
         }
+        if (target === "red" && state.playerCharacter === "wolf") {
+            const guarded = state.caseSolved || state.caseEvidence.length >= 2;
+            return {
+                state: applyTransition(state, st => ({
+                    ...st,
+                    wolfJudgment: guarded ? "cautious" : "risk"
+                })),
+                text: guarded
+                    ? "The red-cloaked girl has followed evidence instead of the logger's chalk. She may be trying to stop the illness; that does not make her your ally, and you keep your distance."
+                    : "The red-cloaked girl carries the logger's mark and knows too little of the sickness. You judge her a risk, not an enemy you can afford to misread."
+            };
+        }
         if (target === "raven") {
             return {
                 state: applyTransition(state, st => rememberFragment(`The raven remembers the turnings and counts three witnesses to the forest pact.`)(st)),
@@ -981,6 +1218,148 @@ const handlers = {
         : target === "basket"
             ? handlers.examine({ state, target: "basket" })
             : { text: "There is nothing legible here. Try 'read journal' to revisit what the loops have taught you." },
+
+    diagnose: async ({ state }) => {
+        if (state.playerCharacter !== "red") return { text: "The wolf can track exposure and contain it, but diagnosis belongs to Red's casework." };
+        const inference = await evaluateOutbreak(state);
+        if (!inference.diagnosedSource) {
+            const likely = inference.inferredSources.length
+                ? `Evidence suggests: ${inference.inferredSources.join(", ")}.`
+                : "The evidence does not yet support a source.";
+            return {
+                text: `${likely} Compare the quota marks and brook, the oak rings and spores, or the well and brook before making an accusation.`
+            };
+        }
+        const s = applyTransition(state, st => addMemoryKey({
+            ...st,
+            caseSolved: true
+        }, "diagnosed_outbreak", CASE_SOURCE_TEXT[inference.diagnosedSource]));
+        const urgent = inference.urgentGroups.length
+            ? ` Urgent care is needed in ${inference.urgentGroups.map(group => GROUP_LABELS[group]).join(", ")}.`
+            : "";
+        return {
+            state: s,
+            text: `${CASE_SOURCE_TEXT[inference.diagnosedSource]}${urgent} Evidence permits a supported accusation, but care can begin before the case is closed.`
+        };
+    },
+
+    accuse: async ({ state, target }) => {
+        if (state.playerCharacter !== "red") return { text: "The wolf does not prosecute suspects. Track the sick groups and decide whether to protect Red or keep away." };
+        const suspect = target === "woodcutter"
+            ? "woodcutter"
+            : target === "bargain" || target === "forest"
+                ? "forest_pact"
+                : target === "water_supply"
+                    ? "water_supply"
+                    : null;
+        if (!suspect) return { text: "Accuse only from evidence: 'accuse woodcutter', 'accuse pact', or 'accuse well'." };
+        const inference = await evaluateOutbreak(state);
+        if (!inference.supportedAccusations.includes(suspect)) {
+            const stateHint = inference.inferredSources.length
+                ? "Your evidence points to a possible source, but does not support that accusation."
+                : "Gather paired clues and diagnose the outbreak before accusing anyone.";
+            return { text: `${stateHint} A wrong accusation does not change anyone's health.` };
+        }
+        const s = applyTransition(state, st => ({
+            ...st,
+            caseSolved: true,
+            accusations: Object.freeze([...st.accusations, suspect])
+        }));
+        return {
+            state: s,
+            text: `${CASE_SOURCE_TEXT[inference.diagnosedSource]} Your accusation is supported as a cause, not a verdict of personal guilt. The response is prevention and care, not punishment.`
+        };
+    },
+
+    track: ({ state, target }) => {
+        if (state.playerCharacter !== "wolf") return { text: "Tracking the sick trail is the wolf's perspective; Red can investigate evidence and diagnose the case." };
+        const s = applyTransition(state, st => addMemoryKey({
+            ...st,
+            wolfTracked: true
+        }, "wolf_tracked_outbreak", "The wolf followed symptoms through the forest and learned which communities were exposed."));
+        const affected = state.exposedGroups.map(group =>
+            `${GROUP_LABELS[group]} (${state.communityWellness[group]}% wellness)`).join(", ");
+        return {
+            state: s,
+            text: `You follow the scent of fever, damp bark, and foul water. Exposure is present in: ${affected}. Contain each affected group, then guard the heart oak to stop the trail from spreading.`
+        };
+    },
+
+    contain: ({ state, target }) => {
+        if (state.playerCharacter !== "wolf") return { text: "Containment is the wolf's role. Red can provide care with 'give remedies to hamlet/woodland/camp'." };
+        if (!state.wolfTracked) return { text: "Track the outbreak first; you will not quarantine a community on scent alone." };
+        if (!COMMUNITY_GROUPS.includes(target)) return { text: "Choose a group to protect: hamlet, woodland, or logging camp." };
+        const contained = new Set(state.wolfContainedGroups);
+        const protectedGroups = new Set(state.communityProtected);
+        contained.add(target);
+        protectedGroups.add(target);
+        const nextState = {
+            ...state,
+            wolfContainedGroups: Object.freeze([...contained]),
+            communityProtected: Object.freeze([...protectedGroups])
+        };
+        const allExposuresContained = state.exposedGroups.every(group => contained.has(group));
+        const finished = allExposuresContained && state.heartOakProtected;
+        const s = applyTransition(state, st => finished
+            ? recordEnding(nextState, "wolf_sentinel")
+            : nextState);
+        return {
+            state: s,
+            text: `${GROUP_LABELS[target]} is isolated from the next wave without cutting it off from care. ${allExposuresContained
+                ? (state.heartOakProtected ? "The groups and heart oak are protected; the wolf completes his solitary watch." : "Every exposed group is contained. Guard the heart oak to finish the vigil.")
+                : "Track the remaining exposed groups and protect each without treating isolation as a cure."}${finished ? "\n\nENDING — THE SENTINEL'S VIGIL. The wolf keeps his distance from Red; no alliance is made." : ""}`
+        };
+    },
+
+    guard: ({ state, target }) => {
+        if (state.playerCharacter !== "wolf") return { text: "Red can protect a community with rosemary; the heart oak is guarded from the wolf's perspective." };
+        if (!state.wolfTracked) return { text: "Track the outbreak first so the oak's risk is not confused with the illness itself." };
+        if (target === "red") {
+            const cautious = state.caseSolved || state.caseEvidence.length >= 2;
+            const s = applyTransition(state, st => ({
+                ...st,
+                wolfJudgment: cautious ? "cautious" : "risk"
+            }));
+            return {
+                state: s,
+                text: cautious
+                    ? "You cover Red's trail from the logger without revealing yourself. She may be trying to help, but you remain a guardian, not her ally."
+                    : "You keep Red away from the heart oak while the logger's mark is still on her cloak. She is a risk you will watch, not an enemy you will hunt."
+            };
+        }
+        if (target !== "oak" && target !== "heart") return { text: "Guard the heart oak, or guard Red's trail from the logger." };
+        const s = applyTransition(state, st => ({
+            ...st,
+            heartOakProtected: true
+        }));
+        const complete = s.exposedGroups.every(group => s.wolfContainedGroups.includes(group));
+        const finalState = complete
+            ? applyTransition(s, st => recordEnding(st, "wolf_sentinel"))
+            : s;
+        return {
+            state: finalState,
+            text: complete
+                ? "You guard the heart oak and hold every exposed group behind a safe boundary. The outbreak's spread is contained; the wolf remains alone, watchful, and wary of Red.\n\nENDING — THE SENTINEL'S VIGIL."
+                : "You stand over the heart oak. Its rings show where the sickness travels, but guarding the tree cannot replace care for the exposed. Contain each affected community to complete the vigil."
+        };
+    },
+
+    approach: ({ state, target }) => {
+        if (state.playerCharacter !== "wolf" || target !== "red") {
+            return { text: "The wolf can approach Red, but only as a cautious observer; he does not take a human identity or make allies lightly." };
+        }
+        const cautious = state.caseSolved || state.caseEvidence.length >= 2;
+        const s = applyTransition(state, st => ({
+            ...st,
+            wolfJudgment: cautious ? "cautious" : "risk"
+        }));
+        return {
+            state: s,
+            text: cautious
+                ? "You watch Red examine the evidence. She may be following the illness rather than the logger's mark. You choose not to drive her away, but you do not trust her."
+                : "Red carries a streak of logger's chalk and has not yet traced the illness. You warn her from the shadows, then keep your distance."
+        };
+    },
 
     wander: ({ state }) => {
         if (state.location !== "forest_path") {
@@ -1058,11 +1437,37 @@ const handlers = {
     },
 
     give: ({ state, target, priorOutcome, itemsToGive }) => {
-        if (state.location !== "cottage_interior") return { text: "You must be inside Grandmother's cottage to deliver the basket." };
+        if (state.playerCharacter !== "red" ||
+            (state.location !== "cottage_interior" && !COMMUNITY_GROUPS.includes(target))) {
+            return { text: "Red can treat the community along the forest path or deliver the basket at Grandmother's cottage." };
+        }
         const requestedItems = itemsToGive || (target === "basket"
             ? basketItems.map(item => item.name)
-            : (basketItems.some(item => item.name === target) ? [target] : []));
+            : (GIVE_ITEMS.has(target) && target !== "basket" ? [target] : []));
         if (target === "wolf") return { text: "You would never hand your mother's treats to a stranger with teeth like that." };
+        if (COMMUNITY_GROUPS.includes(target)) {
+            const requested = requestedItems.length ? requestedItems : [];
+            const result = recordCommunityCare(state, target, requested);
+            if (result.used.length === 0) {
+                return {
+                    text: result.refused.includes("wine")
+                        ? "Wine can support a negotiation, but it is not treatment. Keep it for the woodcutter's due; use bread, cakes, remedies, or rosemary for community care."
+                        : `You have no usable supplies for ${GROUP_LABELS[target]}.`
+                };
+            }
+            const s = applyTransition(state, st => result.state);
+            const urgent = s.communityWellness[target] < 80 ? " The group remains in the urgent-care range." : "";
+            const prevention = result.used.includes("rosemary")
+                ? ` The rosemary is laid as a protective ward around ${GROUP_LABELS[target]}; it prevents new exposure but does not cure existing illness.`
+                : "";
+            const refused = result.refused.length
+                ? ` Not used: ${result.refused.join(", ")}.`
+                : "";
+            return {
+                state: s,
+                text: `You provide ${result.used.join(", ")} to ${GROUP_LABELS[target]}. Community wellness rises to ${s.communityWellness[target]}%.${prevention}${urgent}${refused}`
+            };
+        }
         if (target === "woodcutter") {
             if (!requestedItems.includes("wine")) {
                 return { text: "The woodcutter refuses the offer. The forest pact names the wine as his due; the bread, cakes, and remedies are for Grandmother." };
@@ -1148,15 +1553,12 @@ const handlers = {
     help: () => ({
         text: [
             "Available Commands:",
-            "• Sensory & Exploration: 'look around', 'listen', 'smell', 'hum tune', 'examine basket', 'examine cloak'",
-            "• Forest Interactions: 'watch squirrels/rabbits/deer', 'watch roots', 'watch oak', 'talk to woodcutter', 'talk to wolf', 'wander off path'",
-            "• Movement: 'walk to cottage', 'go back'",
-            "• Cottage Progression: 'lift latch', 'examine spectacles', 'take spectacles', 'wear spectacles', 'examine walls', 'examine eyes/ears/teeth', 'answer the heart oak remembers every ring'",
-            "• Standoff Choices: 'choose wolf', 'choose woodcutter', 'protect grandmother', or uncover the pact and 'give wine to woodcutter'",
-            "• Resolution: 'open closet', 'untie grandmother', 'give bread to grandmother'",
-            "• Multi-item Giving: 'give wine to woodcutter and bread to grandmother'",
-            "• Lore: 'talk to raven', 'examine journal', 'read basket'",
-            "• True endings: 'keep the count' (Warden) or 'end the bargain' (Unbinding)"
+            "• Red—investigate: 'examine stump/brook/roots/oak/hamlet', 'watch birds', 'diagnose outbreak', 'accuse woodcutter/pact/well'",
+            "• Red—triage: 'give remedies to hamlet', 'give bread to woodland', 'give rosemary to camp'; multi-pair giving is supported",
+            "• Red—story: 'talk to wolf/woodcutter/raven', 'walk to cottage', 'examine eyes/ears/teeth', 'wear spectacles', 'answer the heart oak remembers every ring'",
+            "• Wolf—unlocked after a Red run: 'track outbreak', 'contain hamlet/woodland/camp', 'guard heart oak', 'approach red'",
+            "• Lore and replay: 'examine journal', 'read basket', 'wander off path', 'reset timeline'",
+            "• Red pact choices: 'give wine to woodcutter', then 'keep the count' (Warden) or 'end the bargain' (Unbinding)"
         ].join("\n")
     })
 };
@@ -1169,7 +1571,7 @@ const runCommand = async (userId, command) => {
                 ? "The forest has unraveled. The day cannot turn again."
                 : `The loop is closed. ${ENDING_REGISTRY[state.endingId]?.title || "This ending"} is final; the day does not repeat.`,
             chaosOutcome: await evaluateChaosRules(state),
-            state,
+            state: publicState(state),
             mlTelemetry: { subwords: [], tokenIds: [], corrections: [], resolvedIntent: "TIMELINE CLOSED" }
         };
     }
@@ -1188,12 +1590,37 @@ const runCommand = async (userId, command) => {
             : "UNRESOLVED"
     };
 
+    if (state.playerCharacter === "wolf") {
+        if (state.endingId === "wolf_sentinel") {
+            return {
+                response: "The wolf's vigil is complete. Switch back to Red or reset to carry the memory into another turning.",
+                chaosOutcome: "wolf_sentinel",
+                state: publicState(state),
+                mlTelemetry
+            };
+        }
+        const handler = ["track", "contain", "guard", "approach", "help"].includes(verb)
+            ? handlers[verb]
+            : null;
+        const result = handler
+            ? await handler({ state, target, command })
+            : { text: "As the wolf, use 'track outbreak', 'contain hamlet/woodland/camp', 'guard heart oak', or 'approach red'. Type 'help' for commands." };
+        if (result.state) state = result.state;
+        await savePlayerStateToDB(userId, state, state.endingId || "wolf_campaign");
+        return {
+            response: result.text,
+            chaosOutcome: state.endingId || "wolf_campaign",
+            state: publicState(state),
+            mlTelemetry
+        };
+    }
+
     const priorOutcome = await evaluateChaosRules(state);
     if (priorOutcome === "wolf_overwhelms_red") {
         return {
             response: `The wolf has already gotten you. Press 'Reset Timeline' to try again. ${state.loopCount > 0 ? `You remember the last loop: ${state.memoryFragments[state.memoryFragments.length - 1] || 'The forest keeps replaying its own lesson.'}` : 'The forest still feels strangely familiar.'}`,
             chaosOutcome: priorOutcome,
-            state,
+            state: publicState(state),
             mlTelemetry
         };
     }
@@ -1209,7 +1636,7 @@ const runCommand = async (userId, command) => {
         await savePlayerStateToDB(userId, state, chaosOutcome);
         runSQL(`INSERT INTO chaos_logs (user_id, command, resulting_outcome) VALUES (?, ?, ?)`,
             [userId, command, chaosOutcome]).catch(err => console.error("chaos_logs insert failed:", err.message));
-        return { response: narrativeResponse, chaosOutcome, state, mlTelemetry };
+        return { response: narrativeResponse, chaosOutcome, state: publicState(state), mlTelemetry };
     }
 
     if (resolved && verb === "give") {
@@ -1274,10 +1701,10 @@ const runCommand = async (userId, command) => {
     runSQL(`INSERT INTO chaos_logs (user_id, command, resulting_outcome) VALUES (?, ?, ?)`,
         [userId, command, chaosOutcome]).catch(err => console.error("chaos_logs insert failed:", err.message));
 
-    return { response: narrativeResponse, chaosOutcome, state, mlTelemetry };
+    return { response: narrativeResponse, chaosOutcome, state: publicState(state), mlTelemetry };
 };
 
-const WELCOME_TEXT = "Welcome to LITTLE RED RIDING HOOD: CHAOS IN THE DEEP WOODS.\nYour mother hands you bread, sweet wine, cakes, herbal remedies, and a sprig of rosemary for Grandmother.\n\"Stay on the path, Red. The logger's mark is not your own,\" she warns; you cannot tell why the words feel familiar.\nSomewhere in the cottage, an old pact is keeping the day from moving forward. Type 'help' for commands, or 'look around' to begin.";
+const WELCOME_TEXT = "Welcome to LITTLE RED RIDING HOOD: CHAOS IN THE DEEP WOODS.\nYou are Red. Your basket holds food, herbal remedies, sweet wine, and rosemary. Grandmother is sick, and symptoms have appeared in one forest community.\nGather case clues, use Prolog's inference to diagnose the outbreak, then treat the groups most in need. Your choices shape the forest pact and its health.\nAfter a Red run, the wolf's containment route unlocks. He is playable too, but remains a wary guardian—not Red's automatic ally. Type 'help' or 'look around' to begin.";
 
 const resolveUserId = (raw) => {
     const userId = raw === undefined ? DEFAULT_USER : raw;
@@ -1313,12 +1740,64 @@ app.get('/api/state', async (req, res) => {
             response: saved
                 ? saved.gameOverTrue || saved.endingId === "forest_collapse"
                     ? "This timeline has reached its ending. The day does not repeat."
-                    : `Resumed saved timeline for '${userId}'. Type 'look around' to get your bearings, or press Reset Timeline to start over.`
+                    : `Resumed the ${state.playerCharacter === "wolf" ? "wolf's containment route" : "Red's investigation"} for '${userId}'. Type 'help' to review available actions.`
                 : WELCOME_TEXT,
             chaosOutcome: await evaluateChaosRules(state),
-            state,
+            state: publicState(state),
             isNew: !saved
         });
+    } catch (error) {
+        console.error(error);
+        res.status(500).json({ error: error.message });
+    }
+});
+
+app.post('/api/character', async (req, res) => {
+    const userId = resolveUserId(req.body?.userId);
+    if (!userId) return badUser(res);
+    const character = req.body?.character;
+    if (!["red", "wolf"].includes(character)) {
+        return res.status(400).json({ error: "Choose a playable character: 'red' or 'wolf'." });
+    }
+    try {
+        await dbReady;
+        const result = await withUserLock(userId, async () => {
+            let state = await getPlayerStateFromDB(userId);
+            if (!state) return { status: 404, error: "Start Red's route before selecting another character." };
+            if (state.gameOverTrue || state.endingId === "forest_collapse") {
+                return { status: 409, error: "This timeline has ended; its playable character cannot be changed." };
+            }
+            if (character === "wolf" && state.endingsSeen.length === 0 && state.loopCount === 0) {
+                return { status: 409, error: "Complete or reset one Red run to unlock the wolf's perspective." };
+            }
+            if (character === "red" && state.playerCharacter === "wolf") {
+                state = { ...createInitialState(state), playerCharacter: "red" };
+            } else {
+                state = {
+                    ...state,
+                    playerCharacter: character,
+                    location: "forest_path",
+                    endingId: null,
+                    gameOverTrue: false,
+                    wolfTracked: false,
+                    wolfContainedGroups: Object.freeze([]),
+                    wolfJudgment: null,
+                    heartOakProtected: false
+                };
+            }
+            const outcome = character === "wolf" ? "wolf_campaign" : await evaluateChaosRules(state);
+            await savePlayerStateToDB(userId, state, outcome);
+            return {
+                status: 200,
+                response: character === "wolf"
+                    ? "You take the wolf's perspective. The outbreak threatens the forest communities and the heart oak. Contain the spread; do not mistake protection for trust."
+                    : "The day turns again. You are Red, carrying memories of what the wolf saw. Investigate, diagnose, and triage the outbreak.",
+                chaosOutcome: outcome,
+                state: publicState(state)
+            };
+        });
+        if (result.status !== 200) return res.status(result.status).json({ error: result.error });
+        res.json(result);
     } catch (error) {
         console.error(error);
         res.status(500).json({ error: error.message });
@@ -1352,9 +1831,11 @@ app.post('/api/reset', async (req, res) => {
         res.json({
             response: initialState.endingId === "forest_collapse"
                 ? `Timeline reset. ${rememberText}`
-                : `Timeline reset. The path opens again, but it does not feel new. ${rememberText}\n${motherText} Type 'help' for commands.`,
+                : initialState.playerCharacter === "wolf"
+                    ? `The day turns again from the forest's edge. ${rememberText} The wolf smells a new trail of illness and must decide which groups to contain.`
+                    : `Timeline reset. The path opens again, but it does not feel new. ${rememberText}\n${motherText} Type 'help' for commands.`,
             chaosOutcome: outcome,
-            state: initialState
+            state: publicState(initialState)
         });
     } catch (error) {
         console.error(error);
