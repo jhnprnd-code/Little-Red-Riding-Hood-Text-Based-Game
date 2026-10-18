@@ -1,4 +1,4 @@
-const pl = require('tau-prolog');
+const { runProlog } = require('./prolog_pool');
 
 // ============================================================================
 // WHAT THIS MODULE IS
@@ -327,54 +327,28 @@ const INTENT_RULES = `
     parsed_intent(unknown, [none]).
 `;
 
-// Convert a tau-prolog list term to a JavaScript array of atom ids.
-const prologListToArray = (term) => {
-    const result = [];
-    let current = term;
-    while (current && current.id === '.' && current.args && current.args.length === 2) {
-        result.push(current.args[0].id);
-        current = current.args[1];
-    }
-    return result;
-};
-
 const resolveIntentWithProlog = (encodedWords) => {
-    return new Promise((resolve, reject) => {
-        const session = pl.create();
+    // Only fully-learned words (a single "word</w>" token) become facts.
+    const wordFacts = encodedWords
+        .map((tokens, i) =>
+            isSingleWordToken(tokens)
+                ? `word(${i + 1}, '${tokens[0].replace("</w>", "")}').`
+                : null)
+        .filter(Boolean)
+        .join("\n");
 
-        // Only fully-learned words (a single "word</w>" token) become facts
-        const wordFacts = encodedWords
-            .map((tokens, i) =>
-                isSingleWordToken(tokens)
-                    ? `word(${i + 1}, '${tokens[0].replace("</w>", "")}').`
-                    : null)
-            .filter(Boolean)
-            .join("\n");
-
-        session.consult(`${INTENT_RULES}\n${lexiconFacts}\n${wordFacts}\n`, {
-            success: () => {
-                session.query("parsed_intent(Verb, Targets).", {
-                    success: () => {
-                        session.answer(answer => {
-                            if (pl.type.is_error(answer)) {
-                                reject(new Error(pl.format_answer(answer)));
-                            } else if (pl.type.is_substitution(answer)) {
-                                const targets = prologListToArray(answer.lookup("Targets"));
-                                resolve({
-                                    verb: answer.lookup("Verb").id,
-                                    target: targets[0] || 'around',
-                                    targets: targets
-                                });
-                            } else {
-                                resolve({ verb: "unknown", target: "none", targets: ["none"] });
-                            }
-                        });
-                    },
-                    error: reject
-                });
-            },
-            error: reject
-        });
+    return runProlog(
+        `${INTENT_RULES}\n${lexiconFacts}\n${wordFacts}\n`,
+        "parsed_intent(Verb, Targets).",
+        ["Verb", "Targets"]
+    ).then(result => {
+        if (!result) return { verb: "unknown", target: "none", targets: ["none"] };
+        const targets = result.Targets;
+        return {
+            verb: result.Verb,
+            target: targets[0] || 'around',
+            targets
+        };
     });
 };
 

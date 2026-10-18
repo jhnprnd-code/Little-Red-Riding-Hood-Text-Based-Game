@@ -2,8 +2,8 @@ const express = require('express');
 const cors = require('cors');
 const path = require('path');
 const sqlite3 = require('sqlite3').verbose();
-const pl = require('tau-prolog');
 const { encodeCommand, resolveIntentWithProlog } = require('./ml_tokenizer');
+const { runProlog } = require('./prolog_pool');
 
 const app = express();
 app.use(cors());
@@ -636,21 +636,12 @@ const OUTBREAK_RULES = `
     accusation_allowed(water_supply) :- case_accurate, outbreak_source(shared_water).
 
     urgent_group(Group) :- exposed(Group), community_wellness(Group, Score), Score < 80.
-`;
 
-const prologHasSolution = (program, query) => new Promise((resolve, reject) => {
-    const session = pl.create();
-    session.consult(program, {
-        success: () => session.query(query, {
-            success: () => session.answer(answer => {
-                if (pl.type.is_error(answer)) reject(new Error(pl.format_answer(answer)));
-                else resolve(pl.type.is_substitution(answer));
-            }),
-            error: reject
-        }),
-        error: reject
-    });
-});
+    outbreak_result(Sources, Suspects, Groups) :-
+        findall(Source, diagnosis(Source), Sources),
+        findall(Suspect, accusation_allowed(Suspect), Suspects),
+        findall(Group, urgent_group(Group), Groups).
+`;
 
 const evaluateOutbreak = async (state) => {
     const facts = [
@@ -660,32 +651,24 @@ const evaluateOutbreak = async (state) => {
         ...COMMUNITY_GROUPS.map(group => `community_wellness(${group},${state.communityWellness[group]}).`)
     ].join("\n");
     const program = `${facts}\n${OUTBREAK_RULES}`;
-    const inferredSources = [];
-    for (const source of OUTBREAK_CASES.map(item => item.source)) {
-        if (await prologHasSolution(program, `diagnosis(${source}).`)) inferredSources.push(source);
-    }
-    const supportedAccusations = [];
-    for (const suspect of ["woodcutter", "forest_pact", "water_supply"]) {
-        if (await prologHasSolution(program, `accusation_allowed(${suspect}).`)) supportedAccusations.push(suspect);
-    }
-    const urgentGroups = [];
-    for (const group of COMMUNITY_GROUPS) {
-        if (await prologHasSolution(program, `urgent_group(${group}).`)) urgentGroups.push(group);
-    }
+    const result = await runProlog(
+        program,
+        "outbreak_result(Sources, Suspects, Groups).",
+        ["Sources", "Suspects", "Groups"]
+    );
+    const inferredSources = result?.Sources || [];
     return {
         inferredSources,
         diagnosedSource: inferredSources.includes(state.outbreakSource) ? state.outbreakSource : null,
-        supportedAccusations,
-        urgentGroups
+        supportedAccusations: result?.Suspects || [],
+        urgentGroups: result?.Groups || []
     };
 };
 
 const evaluateChaosRules = (state) => {
     if (state.gameOverTrue) return Promise.resolve("true_ending");
     if (state.endingId === "forest_collapse") return Promise.resolve("forest_collapse");
-    return new Promise((resolve, reject) => {
-        const session = pl.create();
-        const facts = `
+    const facts = `
             stayed_on_path(${state.stayedOnPath}).
             talked_to_wolf(${state.talkedToWolf}).
             revealed_destination(${state.revealedDestination}).
@@ -705,22 +688,8 @@ const evaluateChaosRules = (state) => {
             basket_delivered(${basketItems.every(item => !state.inventory.includes(item.name))}).
             wolf_subdued(${state.wolfSubdued}).
         `;
-        session.consult(facts + CHAOS_RULES, {
-            success: () => {
-                session.query("story_outcome(Outcome).", {
-                    success: () => {
-                        session.answer(answer => {
-                            if (pl.type.is_error(answer)) reject(new Error(pl.format_answer(answer)));
-                            else if (pl.type.is_substitution(answer)) resolve(answer.lookup("Outcome").id);
-                            else resolve("uncertain");
-                        });
-                    },
-                    error: reject
-                });
-            },
-            error: reject
-        });
-    });
+    return runProlog(facts + CHAOS_RULES, "story_outcome(Outcome).", ["Outcome"])
+        .then(result => result?.Outcome || "uncertain");
 };
 
 // ============================================================================
